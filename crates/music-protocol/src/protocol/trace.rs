@@ -1,16 +1,66 @@
 //! Private immutable trace files at caller-supplied paths.
 //! No application directory layout or journal policy is imposed.
 use anyhow::{Context, Result};
-use std::{fs, os::unix::fs::OpenOptionsExt};
+use std::{
+    ffi::{CString, OsStr},
+    fs,
+    os::{
+        fd::FromRawFd,
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    },
+    path::{Component, Path},
+};
+
+/// An FD-relative directory alias used by Linux callers. macOS has openat()
+/// but no /proc/self/fd filesystem; using the held descriptor avoids needing
+/// to resolve a pathname through procfs on either platform.
+fn proc_fd_child(path: &Path) -> Option<(libc::c_int, &OsStr)> {
+    let mut parts = path.strip_prefix("/proc/self/fd").ok()?.components();
+    let Component::Normal(fd) = parts.next()? else {
+        return None;
+    };
+    let Component::Normal(file_name) = parts.next()? else {
+        return None;
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let fd = fd.to_str()?.parse::<libc::c_int>().ok()?;
+    (fd >= 0).then_some((fd, file_name))
+}
 
 /// Create a new mode-0600 trace without replacing or following an existing path.
-pub fn private_file(path: &std::path::Path) -> Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating new private trace file {}", path.display()))
+/// For one filename under /proc/self/fd/<directory-fd>, create directly through
+/// openat() so that macOS hosts do not need the Linux procfs mount.
+pub fn private_file(path: &Path) -> Result<fs::File> {
+    (|| {
+        if let Some((directory_fd, filename)) = proc_fd_child(path) {
+            let name = CString::new(filename.as_bytes())?;
+            // SAFETY: 'name' is a NUL-terminated leaf filename with no '/'
+            // components, and openat returns a new owned descriptor on success.
+            let fd = unsafe {
+                libc::openat(
+                    directory_fd,
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
+                        | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o600 as libc::mode_t,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: openat succeeded and transferred ownership of this new
+            // descriptor to the File; no other owner closes it.
+            return Ok(unsafe { fs::File::from_raw_fd(fd) });
+        }
+        Ok(fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?)
+    })()
+    .with_context(|| format!("creating new private trace file {}", path.display()))
 }
 
 /// Write and synchronize a new private trace at the caller-supplied path.
