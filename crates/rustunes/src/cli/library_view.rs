@@ -175,112 +175,222 @@ fn count(value: &Value) -> String {
     grouped
 }
 
-/// Compact terminal presentation for the independent read-only SQLite diagnostics.
-/// JSON clients continue receiving the original full structured report.
-pub fn write_playlists(report: &Value, comparison_requested: bool, out: &mut impl Write) -> Result<()> {
-    if comparison_requested {
-        let comparison = &report["favorites_comparison"];
-        let name = display(comparison["playlist_name"].as_str().unwrap_or("playlist"));
-        writeln!(out, "FAVORITES vs {name}")?;
-        writeln!(out, "{}", "-".repeat(52))?;
-        if let Some(error) = comparison["error"].as_str() {
-            writeln!(out, "Comparison unavailable: {}", display(error))?;
-        } else {
-            for (label, key) in [
-                ("Favorited on iPhone", "liked_state_2_tracks"),
-                ("Tracks in playlist", "playlist_synced_music_tracks"),
-                ("Matching tracks", "overlap"),
-            ] {
-                writeln!(out, "  {:<30} {:>10}", label, count(&comparison[key]))?;
-            }
-            for (label, key) in [
-                ("Favorites missing from playlist", "favorite_not_in_playlist"),
-                ("Playlist tracks not favorited", "playlist_not_favorited"),
-            ] {
-                let n = comparison[key].as_array().map_or(0, Vec::len);
-                writeln!(out, "  {:<30} {:>10}", label, count(&json!(n)))?;
-            }
-            for (key, heading) in [
-                ("favorite_not_in_playlist", "FAVORITES NOT IN PLAYLIST"),
-                ("playlist_not_favorited", "PLAYLIST TRACKS NOT FAVORITED"),
-            ] {
-                if let Some(items) = comparison[key].as_array() {
-                    if items.is_empty() {
-                        continue;
-                    }
-                    writeln!(out, "\n{heading} ({})", count(&json!(items.len())))?;
-                    for item in items {
-                        let artist = display(item["artist"].as_str().unwrap_or("Unknown artist"));
-                        let title = display(item["title"].as_str().unwrap_or("Unknown title"));
-                        writeln!(out, "  {artist} — {title}")?;
-                    }
-                }
-            }
-            let unresolved = comparison["playlist_unmatched_members"].as_u64().unwrap_or(0);
-            let duplicated = comparison["duplicate_membership_rows"].as_u64().unwrap_or(0);
-            if unresolved != 0 || duplicated != 0 {
-                writeln!(out, "\nMembership notes: {unresolved} unresolved, {duplicated} duplicates")?;
-            }
-        }
+const PLAYLIST_NAME_WIDTH: usize = 28;
+
+fn short_label(value: &str, width: usize) -> String {
+    let safe = display(value);
+    if safe.chars().count() <= width {
+        safe
     } else {
-        let all = report["playlists"].as_array().cloned().unwrap_or_default();
-        let music: Vec<_> = all.iter().filter(|p| p["music_members"].as_i64().unwrap_or(0) > 0).collect();
-        let other: Vec<_> = all.iter().filter(|p| p["music_members"].as_i64().unwrap_or(0) == 0).collect();
-        let name = |p: &Value| {
-            let label = display(p["name"].as_str().unwrap_or("(unnamed)"));
-            if p["is_primary_library"] == true { format!("{label} [primary]") } else { label }
-        };
-        let width = all.iter().map(|p| name(p).chars().count()).max().unwrap_or(16).clamp(20, 46);
-        writeln!(out, "PLAYLISTS WITH MUSIC ({})", music.len())?;
-        writeln!(out, "  {:<width$} {:>9}", "NAME", "TRACKS", width=width)?;
-        writeln!(out, "  {}", "-".repeat(width + 10))?;
-        for p in music {
-            writeln!(out, "  {:<width$} {:>9}", name(p), count(&p["music_members"]), width=width)?;
-        }
-        if !other.is_empty() {
-            writeln!(out, "\nOTHER CONTAINERS ({})", other.len())?;
-            writeln!(out, "  {:<width$} {:>9} {:>11}", "NAME", "MEMBERS", "UNRESOLVED", width=width)?;
-            writeln!(out, "  {}", "-".repeat(width + 22))?;
-            for p in other {
-                writeln!(
-                    out,
-                    "  {:<width$} {:>9} {:>11}",
-                    name(p), count(&p["members"]), count(&p["dangling_members"]), width=width
-                )?;
-            }
-        }
+        safe.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+    }
+}
+
+fn container_name(playlist: &Value) -> String {
+    let name = playlist["name"].as_str().unwrap_or("(unnamed)");
+    let suffix = if playlist["is_primary_library"] == true {
+        " [primary]"
+    } else {
+        ""
+    };
+    short_label(&format!("{name}{suffix}"), PLAYLIST_NAME_WIDTH)
+}
+
+fn system_container(playlist: &Value) -> bool {
+    playlist["is_primary_library"] == true
+        || matches!(
+            playlist["name"].as_str(),
+            Some("Playback History" | "Photos Memories" | "Voice Memos")
+        )
+}
+
+/// Human-readable terminal output; --json retains the complete raw evidence.
+pub fn write_playlists(
+    report: &Value,
+    comparison_requested: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    if comparison_requested {
+        write_favorites_comparison(report, out)?;
+    } else {
+        write_playlist_inventory(report, out)?;
+    }
+    write_catalog_notes(report, out)
+}
+
+fn write_playlist_inventory(report: &Value, out: &mut impl Write) -> Result<()> {
+    let all = report["playlists"].as_array().cloned().unwrap_or_default();
+    let active: Vec<_> = all.iter()
+        .filter(|p| !system_container(p) && p["music_members"].as_i64().unwrap_or(0) > 0)
+        .collect();
+    let unmatched: Vec<_> = all.iter()
+        .filter(|p| !system_container(p) && p["music_members"].as_i64().unwrap_or(0) == 0)
+        .collect();
+    let system: Vec<_> = all.iter().filter(|p| system_container(p)).collect();
+    let favorites = &report["favorites"]["candidate_favorite_tracks_liked_state_2"];
+
+    writeln!(out, "\nIPHONE MUSIC  /  PLAYLISTS")?;
+    writeln!(out, "{}", "─".repeat(62))?;
+    writeln!(
+        out,
+        "  {} containers    {} playlists with music    {} favorites",
+        count(&json!(all.len())),
+        count(&json!(active.len())),
+        count(favorites)
+    )?;
+
+    writeln!(out, "\nPLAYLISTS  ({})", active.len())?;
+    writeln!(out, "  {:<28} {:>9}", "Name", "Tracks")?;
+    writeln!(out, "  {}", "─".repeat(38))?;
+    for p in &active {
         writeln!(
             out,
-            "\nFAVORITES  {} tracks (liked_state=2)",
-            count(&report["favorites"]["candidate_favorite_tracks_liked_state_2"]),
+            "  {:<28} {:>9}",
+            container_name(p),
+            count(&p["music_members"])
         )?;
     }
-    if let Some(warnings) = report["warnings"].as_array() {
-        let amount = |code: &str| warnings.iter()
-            .find(|w| w["code"] == code)
-            .and_then(|w| w["count"].as_i64())
-            .unwrap_or(0);
-        let albums = amount("albums_without_artist");
-        let tracks = amount("tracks_in_albums_without_artist");
-        if albums > 0 {
-            writeln!(out, "\nCatalog note: {albums} albums have no artist link ({tracks} tracks).")?;
+
+    if !unmatched.is_empty() {
+        writeln!(out, "\nPLAYLISTS WITH NO MATCHED MUSIC  ({})", unmatched.len())?;
+        writeln!(out, "  {:<28} {:>9} {:>11}", "Name", "Entries", "Unresolved")?;
+        writeln!(out, "  {}", "─".repeat(50))?;
+        for p in &unmatched {
+            writeln!(
+                out,
+                "  {:<28} {:>9} {:>11}",
+                container_name(p),
+                count(&p["members"]),
+                count(&p["dangling_members"])
+            )?;
         }
-        for warning in warnings {
-            let code = warning["code"].as_str().unwrap_or("unknown");
-            if ["albums_without_artist", "tracks_in_albums_without_artist"].contains(&code) {
-                continue;
+    }
+
+    if !system.is_empty() {
+        writeln!(out, "\nBUILT-IN / LIBRARY CONTAINERS  ({})", system.len())?;
+        writeln!(out, "  {:<28} {:>9} {:>11}", "Name", "Entries", "Unresolved")?;
+        writeln!(out, "  {}", "─".repeat(50))?;
+        for p in &system {
+            writeln!(
+                out,
+                "  {:<28} {:>9} {:>11}",
+                container_name(p),
+                count(&p["members"]),
+                count(&p["dangling_members"])
+            )?;
+        }
+    }
+
+    writeln!(
+        out,
+        "\nUnresolved = membership refers to an item not present in this database snapshot."
+    )?;
+    Ok(())
+}
+
+fn write_favorites_comparison(report: &Value, out: &mut impl Write) -> Result<()> {
+    let comparison = &report["favorites_comparison"];
+    let name = short_label(
+        comparison["playlist_name"].as_str().unwrap_or("playlist"),
+        PLAYLIST_NAME_WIDTH,
+    );
+    writeln!(out, "\nIPHONE MUSIC  /  FAVORITES vs {name}")?;
+    writeln!(out, "{}", "─".repeat(62))?;
+    if let Some(error) = comparison["error"].as_str() {
+        writeln!(out, "Comparison unavailable: {}", display(error))?;
+        return Ok(());
+    }
+
+    for (label, key) in [
+        ("Favorited on iPhone", "liked_state_2_tracks"),
+        ("In playlist", "playlist_synced_music_tracks"),
+        ("In both", "overlap"),
+    ] {
+        writeln!(out, "  {:<32} {:>8}", label, count(&comparison[key]))?;
+    }
+
+    let missing = comparison["favorite_not_in_playlist"].as_array();
+    let extra = comparison["playlist_not_favorited"].as_array();
+    writeln!(out, "  {}", "─".repeat(43))?;
+    writeln!(
+        out,
+        "  {:<32} {:>8}",
+        "Favorites missing from playlist",
+        count(&json!(missing.map_or(0, Vec::len)))
+    )?;
+    writeln!(
+        out,
+        "  {:<32} {:>8}",
+        "Playlist tracks not favorited",
+        count(&json!(extra.map_or(0, Vec::len)))
+    )?;
+
+    for (tracks, title) in [
+        (missing, "FAVORITES NOT IN PLAYLIST"),
+        (extra, "PLAYLIST TRACKS NOT FAVORITED"),
+    ] {
+        if let Some(tracks) = tracks.filter(|rows| !rows.is_empty()) {
+            writeln!(out, "\n{title}  ({})", tracks.len())?;
+            for track in tracks {
+                let artist = display(track["artist"].as_str().unwrap_or("Unknown artist"));
+                let song = display(track["title"].as_str().unwrap_or("Unknown title"));
+                writeln!(out, "  {artist} — {song}")?;
             }
-            if let Some(n) = warning["count"].as_i64() {
-                writeln!(out, "Catalog note: {code} ({n})")?;
-            } else if let Some(error) = warning["query_error"].as_str().or_else(|| warning["message"].as_str()) {
-                writeln!(out, "Catalog note: {code} — {}", display(error))?;
-            } else {
-                writeln!(out, "Catalog note: {code}")?;
-            }
+        }
+    }
+    let unresolved = comparison["playlist_unmatched_members"].as_u64().unwrap_or(0);
+    let duplicated = comparison["duplicate_membership_rows"].as_u64().unwrap_or(0);
+    if unresolved != 0 || duplicated != 0 {
+        writeln!(
+            out,
+            "\nMembership notes: {unresolved} unresolved, {duplicated} duplicate rows"
+        )?;
+    }
+    Ok(())
+}
+
+fn write_catalog_notes(report: &Value, out: &mut impl Write) -> Result<()> {
+    let Some(warnings) = report["warnings"].as_array() else {
+        return Ok(());
+    };
+    let amount = |code: &str| warnings.iter()
+        .find(|warning| warning["code"] == code)
+        .and_then(|warning| warning["count"].as_i64())
+        .unwrap_or(0);
+    let albums = amount("albums_without_artist");
+    let tracks = amount("tracks_in_albums_without_artist");
+    let other: Vec<_> = warnings.iter()
+        .filter(|warning| !matches!(
+            warning["code"].as_str(),
+            Some("albums_without_artist" | "tracks_in_albums_without_artist")
+        ))
+        .collect();
+    if albums == 0 && other.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "\nCATALOG NOTES")?;
+    if albums > 0 {
+        writeln!(
+            out,
+            "  {albums} albums have no artist link ({tracks} tracks affected)"
+        )?;
+    }
+    for warning in other {
+        let code = warning["code"].as_str().unwrap_or("unknown");
+        if let Some(n) = warning["count"].as_i64() {
+            writeln!(out, "  {code}: {n}")?;
+        } else if let Some(error) = warning["query_error"]
+            .as_str()
+            .or_else(|| warning["message"].as_str())
+        {
+            writeln!(out, "  {code}: {}", display(error))?;
+        } else {
+            writeln!(out, "  {code}")?;
         }
     }
     Ok(())
 }
+
 
 fn matches(track: &Track, filter: &Filter) -> bool {
     let m = &track.metadata;
