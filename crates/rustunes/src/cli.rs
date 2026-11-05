@@ -560,6 +560,8 @@ enum LibraryCommand {
     },
     /// Show track, album, artist, size and artwork registration totals.
     Stats,
+    /// List device playlists with raw membership counts and the liked-state breakdown.
+    Playlists,
 }
 
 #[derive(Subcommand)]
@@ -1484,15 +1486,56 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
         } => {
             // A read-only inventory must not require the strict track model used
             // for planning writes. Surface broken joins as warnings instead.
-            if matches!(&view, LibraryCommand::Stats) && snapshot.is_none() {
+            if matches!(&view, LibraryCommand::Stats | LibraryCommand::Playlists) && snapshot.is_none() {
+                let playlists_view = matches!(&view, LibraryCommand::Playlists);
                 let report = catalogue_capture::diagnose(trace_dir.as_deref(), device::provider).await?;
                 if machine::enabled() {
-                    machine::report("library_stats", &report)?;
+                    machine::report(if playlists_view { "library_playlists" } else { "library_stats" }, &report)?;
                 } else {
                     let mut output = std::io::stdout().lock();
                     if json {
                         serde_json::to_writer_pretty(&mut output, &report)?;
                         writeln!(output)?;
+                    } else if playlists_view {
+                        if let Some(playlists) = report["playlists"].as_array() {
+                            writeln!(output, "{} containers (including built-in lists):", playlists.len())?;
+                            for playlist in playlists {
+                                let name = playlist["name"].as_str().unwrap_or("(unnamed)");
+                                // JSON quoting prevents terminal-control characters in device names.
+                                let name = serde_json::to_string(name)?;
+                                let members = playlist["members"].as_i64().unwrap_or(0);
+                                let music = playlist["music_members"].as_i64().unwrap_or(0);
+                                let primary = playlist["is_primary_library"] == true;
+                                if primary {
+                                    writeln!(output, "  {name}: {members} members ({music} music) [primary library]")?;
+                                } else {
+                                    writeln!(output, "  {name}: {members} members ({music} music)")?;
+                                }
+                                let dangling = playlist["dangling_members"].as_i64().unwrap_or(0);
+                                if dangling > 0 {
+                                    writeln!(output, "    Note: {dangling} memberships reference missing items")?;
+                                }
+                            }
+                        }
+                        let favorites = &report["favorites"];
+                        writeln!(
+                            output,
+                            "Potential favorites (liked_state=2): {}",
+                            favorites["candidate_favorite_tracks_liked_state_2"].as_i64().unwrap_or(0)
+                        )?;
+                        if let Some(states) = favorites["liked_state_counts"].as_array() {
+                            write!(output, "Raw liked_state breakdown:")?;
+                            for state in states {
+                                write!(output, " {}={}", state["state"], state["tracks"])?;
+                            }
+                            writeln!(output)?;
+                        }
+                        writeln!(output, "Favorite-state mapping is provisional until checked against the Music app.")?;
+                        if let Some(warnings) = report["warnings"].as_array() {
+                            for warning in warnings {
+                                writeln!(output, "Diagnostic: {}", warning)?;
+                            }
+                        }
                     } else {
                         let stats = &report["stats"];
                         let shown = |name: &str| stats[name]
@@ -1549,6 +1592,7 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                 }),
                 LibraryCommand::Show { id } => library_view::View::Show(id),
                 LibraryCommand::Stats => library_view::View::Stats,
+                LibraryCommand::Playlists => anyhow::bail!("offline snapshot playlist diagnostics not supported; connect the iPhone"),
             };
             let catalog = if let Some(directory) = snapshot {
                 let line = "Reading saved snapshot; no live device check";
