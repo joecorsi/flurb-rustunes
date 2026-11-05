@@ -1482,6 +1482,61 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
             trace_dir,
             snapshot,
         } => {
+            // A read-only inventory must not require the strict track model used
+            // for planning writes. Surface broken joins as warnings instead.
+            if matches!(&view, LibraryCommand::Stats) && snapshot.is_none() {
+                let report = catalogue_capture::diagnose(trace_dir.as_deref(), device::provider).await?;
+                if machine::enabled() {
+                    machine::report("library_stats", &report)?;
+                } else {
+                    let mut output = std::io::stdout().lock();
+                    if json {
+                        serde_json::to_writer_pretty(&mut output, &report)?;
+                        writeln!(output)?;
+                    } else {
+                        let stats = &report["stats"];
+                        let shown = |name: &str| stats[name]
+                            .as_i64()
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unavailable".into());
+                        writeln!(
+                            output,
+                            "{} tracks · {} album IDs · {} album-artist IDs (including zero)",
+                            shown("tracks"),
+                            shown("album_ids"),
+                            shown("album_artist_ids_including_zero")
+                        )?;
+                        writeln!(
+                            output,
+                            "{} bytes of known music file sizes",
+                            shown("file_bytes_known")
+                        )?;
+                        if let Some(warnings) = report["warnings"].as_array() {
+                            if warnings.is_empty() {
+                                writeln!(output, "No anomalies found by the initial diagnostic checks.")?;
+                            } else {
+                                writeln!(output, "Diagnostic findings (no records changed):")?;
+                                for warning in warnings {
+                                    let code = warning["code"].as_str().unwrap_or("unknown");
+                                    if let Some(count) = warning["count"].as_i64() {
+                                        writeln!(output, "  {code}: {count}")?;
+                                    } else {
+                                        writeln!(
+                                            output,
+                                            "  {code}: {}",
+                                            warning["query_error"]
+                                                .as_str()
+                                                .or_else(|| warning["message"].as_str())
+                                                .unwrap_or("unavailable")
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    output.flush()?;
+                }
+            } else {
             let view = match view {
                 LibraryCommand::List {
                     query,
@@ -1517,6 +1572,7 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                 let mut output = std::io::stdout().lock();
                 library_view::write(&catalog, &view, json, &mut output)?;
                 output.flush()?;
+            }
             }
         }
         Command::Catalog { output, trace_dir } if machine::enabled() => {
