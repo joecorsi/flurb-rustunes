@@ -599,7 +599,7 @@ pub async fn run() -> Result<ExitCode> {
         Ok(parsed) => parsed,
         Err(code) => return Ok(code),
     };
-    let is_list = matches!(cli.command, Command::List { .. });
+    let is_list = matches!(&cli.command, Command::List { .. });
     let verbose = cli.verbose > 0;
     let logged = logging::start(cli.verbose);
     // The command's future is large; it lives on the heap, not main's stack.
