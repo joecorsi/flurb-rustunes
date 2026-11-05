@@ -679,6 +679,40 @@ mod tests {
     }
 
     #[test]
+    fn private_traces_support_fd_relative_paths_without_procfs() {
+        use std::os::fd::AsRawFd;
+
+        let dir = directory();
+        let opened = fs::File::open(&dir).unwrap();
+        let fd_path = Path::new("/proc/self/fd")
+            .join(opened.as_raw_fd().to_string())
+            .join("error.txt");
+        // This works even on macOS, where /proc/self/fd does not exist.
+        private_write(&fd_path, b"trace from held directory").unwrap();
+        let actual = dir.join("error.txt");
+        assert_eq!(fs::read(&actual).unwrap(), b"trace from held directory");
+        assert_eq!(
+            fs::metadata(&actual).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Opening again must not truncate the existing trace.
+        assert!(private_write(&fd_path, b"overwrite").is_err());
+        assert_eq!(fs::read(&actual).unwrap(), b"trace from held directory");
+
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, b"unmodified").unwrap();
+        let symlink_path = dir.join("link.txt");
+        symlink(&victim, &symlink_path).unwrap();
+        let alias = Path::new("/proc/self/fd")
+            .join(opened.as_raw_fd().to_string())
+            .join("link.txt");
+        assert!(private_write(&alias, b"replacement").is_err());
+        assert_eq!(fs::read(victim).unwrap(), b"unmodified");
+        drop(opened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn private_traces_refuse_existing_symlink_without_touching_target() {
         let directory = directory();
         let target = directory.join("target.bin");
