@@ -180,16 +180,17 @@ where
         storage.check()?;
         let attempt = storage.attempt(number)?;
         check_capture(control)?;
+        let attempt_path = attempt.fd_path()?;
         let result = if let Some(control) = control {
             control
                 .run(
                     Duration::from_secs(120),
                     "fresh controlled state original deadline",
-                    capture(attempt.fd_path(), deadline),
+                    capture(attempt_path.clone(), deadline),
                 )
                 .await
         } else {
-            timeout_at(deadline, capture(attempt.fd_path(), deadline))
+            timeout_at(deadline, capture(attempt_path.clone(), deadline))
                 .await
                 .context("fresh state capture original deadline")
                 .and_then(|result| result)
@@ -206,7 +207,7 @@ where
                     "status":"captured", "state_receipt_sha256":hex(&receipt), "prior_failed_attempts":failures,
                     "maximum_attempts":2, "deadline_renewed":false, "phone_writes":0});
                 write_capture_receipt(
-                    &attempt.fd_path().join("capture-attempt.json"),
+                    &attempt.fd_path()?.join("capture-attempt.json"),
                     &record,
                     control,
                 )?;
@@ -223,7 +224,7 @@ where
                 let record = serde_json::json!({"schema":"rustunes.capture-selection", "selected_attempt":number,
                     "canonical_trace":storage.trace, "state_receipt_sha256":hex(&receipt), "failed_attempts":failures,
                     "maximum_attempts":2, "deadline_renewed":false, "phone_writes":0});
-                write_capture_receipt(&storage.fd_path().join("selection.json"), &record, control)?;
+                write_capture_receipt(&storage.fd_path()?.join("selection.json"), &record, control)?;
                 check_capture(control)?;
                 storage.directory.sync_all()?;
                 check_capture(control)?;
@@ -256,14 +257,14 @@ where
                     "status":"failed", "error":message, "catalog_drift_files":changed,
                     "connection_dropped":dropped, "maximum_attempts":2, "deadline_renewed":false, "phone_writes":0});
                 let diagnostic = format!("{message}\n");
-                let error_path = attempt.fd_path().join("error.txt");
+                let error_path = attempt.fd_path()?.join("error.txt");
                 private_write(&error_path, diagnostic.as_bytes())?;
                 let receipt = if control.is_some() {
                     current_json_bytes(&record)?
                 } else {
                     serde_json::to_vec_pretty(&record)?
                 };
-                let receipt_path = attempt.fd_path().join("capture-attempt.json");
+                let receipt_path = attempt.fd_path()?.join("capture-attempt.json");
                 private_write(&receipt_path, &receipt)?;
                 attempt.sync()?;
                 storage.directory.sync_all()?;
@@ -303,9 +304,10 @@ where
     unreachable!("two-attempt loop always returns")
 }
 
-/// Hold directory descriptors and access owned attempts through /proc/self/fd,
-/// so an ancestor rename cannot redirect capture writes. Only Linux's atomic
-/// no-replace publication is supported; no clobbering fallback is permitted.
+/// Hold directory descriptors and publish captures via atomic no-replace rename.
+/// Linux exposes descriptors via procfs; macOS resolves the held descriptor with
+/// F_GETPATH, then checks its inode before using the returned path. No fallback
+/// may replace an existing capture.
 struct AttemptStorage {
     trace: PathBuf,
     parent_path: PathBuf,
@@ -347,7 +349,7 @@ impl AttemptStorage {
         value.check()?;
         Ok(value)
     }
-    fn fd_path(&self) -> PathBuf {
+    fn fd_path(&self) -> Result<PathBuf> {
         fd_path(&self.directory)
     }
     fn check(&self) -> Result<()> {
@@ -409,7 +411,7 @@ struct AttemptDirectory {
     name: OsString,
 }
 impl AttemptDirectory {
-    fn fd_path(&self) -> PathBuf {
+    fn fd_path(&self) -> Result<PathBuf> {
         fd_path(&self.directory)
     }
     fn check(&self, parent: &File) -> Result<()> {
@@ -449,8 +451,37 @@ impl AttemptDirectory {
         Ok(())
     }
 }
-fn fd_path(file: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fd_path(file: &File) -> Result<PathBuf> {
+    Ok(PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
+}
+
+#[cfg(target_os = "macos")]
+fn fd_path(file: &File) -> Result<PathBuf> {
+    use std::ffi::CStr;
+    // macOS has no /proc/self/fd. F_GETPATH resolves the directory held by
+    // this descriptor; validate that the resulting pathname still names it.
+    let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize + 1];
+    // SAFETY: fcntl writes a NUL-terminated path into a PATH_MAX+1 buffer.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error()).context("resolve held capture directory");
+    }
+    // SAFETY: the buffer is initialized to NULs and one extra byte ensures a
+    // terminator even if the kernel writes the maximum accepted path length.
+    let raw = unsafe { CStr::from_ptr(buffer.as_ptr()) };
+    let path = PathBuf::from(OsStr::from_bytes(raw.to_bytes()));
+    ensure!(path.is_absolute(), "held capture directory resolved to a relative path");
+    let named = fs::symlink_metadata(&path)?;
+    let held = file.metadata()?;
+    ensure!(
+        named.is_dir()
+            && !named.file_type().is_symlink()
+            && named.dev() == held.dev()
+            && named.ino() == held.ino(),
+        "capture directory changed during held-descriptor resolution"
+    );
+    Ok(path)
 }
 fn component(name: &OsStr) -> Result<CString> {
     ensure!(
@@ -496,11 +527,26 @@ fn make_dir_at(parent: &File, name: &OsStr) -> Result<()> {
     Ok(())
 }
 fn ensure_absent(parent: &File, name: &OsStr) -> Result<()> {
-    component(name)?;
-    match fs::symlink_metadata(fd_path(parent).join(name)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => anyhow::bail!("capture trace already exists"),
-        Err(error) => Err(error.into()),
+    let name = component(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent is an open directory; name is one NUL-terminated path
+    // component. The stat allocation is written only on successful fstatat.
+    let found = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if found == 0 {
+        anyhow::bail!("capture trace already exists");
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error.into())
     }
 }
 fn open_parent(path: &Path) -> Result<File> {
