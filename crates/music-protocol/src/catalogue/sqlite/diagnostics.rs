@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 
 /// Inspect only existing rows. No schema repair, identity synthesis, or writes.
-pub(super) fn inspect(connection: &Connection) -> Result<Value> {
+pub(super) fn inspect(connection: &Connection, compare_playlist: Option<&str>) -> Result<Value> {
     let mut warnings = Vec::<Value>::new();
     let mut report = json!({
         "source": "read_only_sqlite_diagnostics",
@@ -80,6 +80,10 @@ pub(super) fn inspect(connection: &Connection) -> Result<Value> {
         super::playlist_inspection::inspect(connection);
     report["playlists"] = playlists;
     report["favorites"] = favorites;
+    if let Some(name) = compare_playlist {
+        report["favorites_comparison"] =
+            super::playlist_inspection::compare_favorites(connection, name);
+    }
     warnings.extend(playlist_warnings);
     report["warnings"] = json!(warnings);
     Ok(report)
@@ -97,7 +101,7 @@ mod tests {
             .connection
             .execute_batch("UPDATE album SET album_artist_pid=0 WHERE album_pid=31")
             .unwrap();
-        let report = inspect(&fixture.connection).unwrap();
+        let report = inspect(&fixture.connection, None).unwrap();
         assert_eq!(report["stats"]["tracks"], 1);
         let warnings = report["warnings"].as_array().unwrap();
         assert!(warnings.iter().any(|issue| {
@@ -116,7 +120,7 @@ mod tests {
     fn unexpected_schema_is_a_diagnostic_instead_of_a_parser_failure() {
         let fixture = Fixture::new(false);
         fixture.connection.execute_batch("DROP TABLE album_artist").unwrap();
-        let report = inspect(&fixture.connection).unwrap();
+        let report = inspect(&fixture.connection, None).unwrap();
         assert_eq!(report["stats"]["tracks"], 1);
         assert!(report["warnings"].as_array().unwrap().iter().any(|issue| {
             issue["code"] == "albums_without_artist" && issue.get("query_error").is_some()
