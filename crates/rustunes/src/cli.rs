@@ -6,6 +6,7 @@ mod deletion;
 pub(crate) mod device_view;
 pub(crate) mod journal_view;
 pub(crate) mod library_view;
+mod list_view;
 mod logging;
 mod machine;
 mod metadata_set;
@@ -149,6 +150,11 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Read-only library totals and playlists, or complete inventory as JSON.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// Edit explicit fields of a track on the phone, or plan a typed metadata request.
     Metadata {
         #[command(subcommand)]
@@ -593,6 +599,8 @@ pub async fn run() -> Result<ExitCode> {
         Ok(parsed) => parsed,
         Err(code) => return Ok(code),
     };
+    let is_list = matches!(cli.command, Command::List { .. });
+    let verbose = cli.verbose > 0;
     let logged = logging::start(cli.verbose);
     // The command's future is large; it lives on the heap, not main's stack.
     let run = Box::pin(async move {
@@ -608,9 +616,21 @@ pub async fn run() -> Result<ExitCode> {
     let result = run.await;
     logging::finished(&result);
     result.or_else(|error| {
-        // As main would print it, then what the log adds.
-        eprintln!("Error: {error:?}");
-        logging::dump();
+        if is_list {
+            eprintln!("ERROR [E100]: Could not read the iPhone music library.");
+            eprintln!("Reason: {}", error.root_cause());
+            if verbose {
+                eprintln!("Details: {error:#}");
+            } else {
+                eprintln!("Hint: Check the connection and unlock the iPhone; use --verbose for details.");
+            }
+            if let Some(path) = logging::path() {
+                eprintln!("Log: {}", path.display());
+            }
+        } else {
+            eprintln!("Error: {error:?}");
+            logging::dump();
+        }
         Ok(ExitCode::FAILURE)
     })
 }
@@ -870,6 +890,7 @@ fn reaches_phone(command: &Command) -> bool {
                 ..
             }
             | Command::Snapshot { .. }
+            | Command::List { .. }
             | Command::Library { .. }
             | Command::Catalog { .. }
             | Command::DeviceInfo
@@ -929,6 +950,23 @@ fn configured_engine_output(device: engine::DeviceConfig, deletion_json: bool) -
 
 async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
     match cli.command {
+        Command::List { json } => {
+            let report = if json || machine::enabled() {
+                catalogue_capture::inventory(device::provider).await?
+            } else {
+                catalogue_capture::diagnose(None, None, device::provider).await?
+            };
+            let name = list_device_name().await;
+            if machine::enabled() {
+                let mut out = Vec::new();
+                list_view::write(&report, name.as_deref(), true, cli.verbose > 0, &mut out)?;
+                machine::report_bytes("library_overview", &out)?;
+            } else {
+                let mut out = std::io::stdout().lock();
+                list_view::write(&report, name.as_deref(), json, cli.verbose > 0, &mut out)?;
+                out.flush()?;
+            }
+        }
         Command::Cache { action } => {
             let directory = fingerprint_cache_directory()?;
             match action {
@@ -2212,6 +2250,18 @@ async fn connected_provider() -> Result<device::DeviceProvider> {
     timeout(Duration::from_secs(15), device::provider())
         .await
         .context("timed out discovering the device")?
+}
+
+/// A missing Lockdown name must not invalidate a successful catalogue read.
+async fn list_device_name() -> Option<String> {
+    timeout(Duration::from_secs(8), async {
+        let provider = device::provider().await?;
+        let pairing = provider.get_pairing_file().await?;
+        let mut lockdown = LockdownClient::connect(&provider).await?;
+        lockdown.start_session(&pairing).await?;
+        let value = lockdown.get_value(Some("DeviceName"), None).await?;
+        Ok::<_, anyhow::Error>(value.as_string().map(str::to_owned))
+    }).await.ok()?.ok()?
 }
 
 async fn device_info(
