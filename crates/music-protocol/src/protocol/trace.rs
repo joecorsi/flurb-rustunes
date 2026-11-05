@@ -33,7 +33,7 @@ fn proc_fd_child(path: &Path) -> Option<(libc::c_int, &OsStr)> {
 /// For one filename under /proc/self/fd/<directory-fd>, create directly through
 /// openat() so that macOS hosts do not need the Linux procfs mount.
 pub fn private_file(path: &Path) -> Result<fs::File> {
-    (|| {
+    (|| -> Result<fs::File> {
         if let Some((directory_fd, filename)) = proc_fd_child(path) {
             let name = CString::new(filename.as_bytes())?;
             // SAFETY: 'name' is a NUL-terminated leaf filename with no '/'
