@@ -36,3 +36,41 @@ Rustunes now has a pure `insert_playlist` operation encoder, but the journaled
 playlist-create CLI, signed transport and after-state membership verification
 are still to be implemented. Do not treat a successful track push as evidence
 that the playlist was created.
+
+
+## Experimental playlist creation (feature branch only)
+
+Once the `push generated --dry-run` result confirms exactly ten matched
+Rustunes-owned MP3 tracks (zero additions, zero conflicts), use its retained
+`plan.json` to bind the M3U8 entries to existing device track IDs.
+
+First check the code builds and the new tests pass:
+
+```sh
+cargo test -p rustunes playlist_push
+cargo test -p rustunes playlist_push_requires_an_m3u8
+```
+
+Point `PLAN` to the exact `plan.json` reported by the most recent successful
+track push dry-run:
+
+```sh
+PLAN="/absolute/path/to/plan.json"
+cargo run -- push tests/playlist-sync/playlist.m3u8 --from-plan "$PLAN" --playlist-name "Flurb Playlist Test" --dry-run
+```
+
+**Only after verifying that the dry run reports ten matched tracks**, run:
+
+```sh
+cargo run -- push tests/playlist-sync/playlist.m3u8 --from-plan "$PLAN" --playlist-name "Flurb Playlist Test" --yes
+cargo run -- list
+```
+
+This is an isolated trial of one confirmed `insert_playlist` shape, not a
+production playlist sync. It reuses the existing signed metadata-only transport,
+writes durable input/Started evidence under the local state `playlist-trials`
+directory, refuses duplicate names and ambiguous IDs, and checks the full
+ordered membership and unchanged audio after sending. **Do not blindly rerun
+a started trial after any transport or verification error**; inspect the phone
+with `list` and retain its evidence. The normal `resume` CLI does not yet
+handle these experimental playlist trial records.
