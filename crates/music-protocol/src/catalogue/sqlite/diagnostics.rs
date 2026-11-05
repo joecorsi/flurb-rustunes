@@ -76,6 +76,11 @@ pub(super) fn inspect(connection: &Connection) -> Result<Value> {
             })),
         }
     }
+    let (playlists, favorites, playlist_warnings) =
+        super::playlist_inspection::inspect(connection);
+    report["playlists"] = playlists;
+    report["favorites"] = favorites;
+    warnings.extend(playlist_warnings);
     report["warnings"] = json!(warnings);
     Ok(report)
 }
