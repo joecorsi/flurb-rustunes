@@ -297,6 +297,30 @@ fn read_only_open_preserves_quiescent_bytes_and_refuses_transitions() {
 }
 
 #[test]
+fn read_only_copy_opens_through_symlinked_temp_parent_on_macos() {
+    // macOS returns /var/folders/... as its temp directory, but /var itself
+    // is a symlink. Simulate that alias on all platforms to prevent
+    // SQLITE_CANTOPEN_SYMLINK (1550) from recurring.
+    let temp = Temp::new();
+    drop(Journal::create(&temp.journal(), &scope()).unwrap());
+    let source = File::open(temp.journal().join(DB_NAME)).unwrap();
+    let copy = ReadOnlyCopy::new(&source, source.metadata().unwrap().len()).unwrap();
+    let actual = copy.directory.clone();
+    let alias = temp.0.join("symlinked-temp-copy");
+    std::os::unix::fs::symlink(&actual, &alias).unwrap();
+
+    // Connect through an ancestor that is a symlink; only the disposable
+    // inspection copy can be canonicalized. The original remains unchanged.
+    let mut copy = copy;
+    copy.directory = alias.clone();
+    let connection = copy.connect().unwrap();
+    validate_schema(&connection).unwrap();
+    drop(connection);
+    copy.directory = actual;
+    fs::remove_file(alias).unwrap();
+}
+
+#[test]
 fn read_only_clone_isolates_wal_transition_at_sqlite_boundary() {
     for force_clone_wal in [false, true] {
         let temp = Temp::new();
