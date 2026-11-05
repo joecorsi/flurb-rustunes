@@ -303,10 +303,21 @@ fn held_namespace_refuses_aliases_extra_entries_and_substituted_roots() {
 // a peer same-inode fd in the parent would release its SHM DMS lock.
 fn parent_holds_dms(fd: i32) -> bool {
     let mut pipe = [0; 2];
-    assert_eq!(
-        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
-        0
-    );
+    // pipe2(O_CLOEXEC) is Linux-only. On macOS, create the same pipe and
+    // set close-on-exec on both ends before forking the lock-check child.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    for fd in pipe {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0
+        {
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            panic!("failed to set close-on-exec on local lock-control pipe");
+        }
+    }
     let parent_pid = unsafe { libc::getpid() };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
