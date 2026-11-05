@@ -521,6 +521,78 @@ mod tests {
     }
 
     #[test]
+    fn insert_playlist_encodes_confirmed_ordered_two_operation_shape() {
+        let catalog = crate::test_support::catalogue::collection_catalog(40);
+        let id = catalog.tracks()[0].sync_id;
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let pid = 0x8000_0000_0000_0042u64;
+        let bytes = insert_playlist(&catalog, pid, "Flurb Sync Test", &[id], time).unwrap();
+        let root = Value::from_reader(Cursor::new(&bytes)).unwrap();
+        let env = root.as_dictionary().unwrap();
+        assert_eq!(env["revision"].as_unsigned_integer(), Some(41));
+        let ops = env["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            ops[0].as_dictionary().unwrap()["operation"].as_string(),
+            Some("update_db_info")
+        );
+        let op = ops[1].as_dictionary().unwrap();
+        assert_eq!(
+            keys(op),
+            BTreeSet::from([
+                "operation", "pid", "container", "container_ui", "item_to_container"
+            ])
+        );
+        assert_eq!(op["operation"].as_string(), Some("insert_playlist"));
+        assert_eq!(op["pid"].as_signed_integer(), Some(i64::MIN + 66));
+        let container = op["container"].as_dictionary().unwrap();
+        assert_eq!(
+            keys(container),
+            BTreeSet::from(["name", "date_created", "date_modified"])
+        );
+        assert_eq!(container["name"].as_string(), Some("Flurb Sync Test"));
+        assert_eq!(container["date_created"].as_date(), Some(time.into()));
+        assert_eq!(container["date_modified"].as_date(), Some(time.into()));
+        let ui = op["container_ui"].as_dictionary().unwrap();
+        assert_eq!(
+            keys(ui),
+            BTreeSet::from([
+                "play_order", "album_field_order", "repeat_mode",
+                "is_reversed", "shuffle_items", "has_been_shuffled"
+            ])
+        );
+        assert_eq!(ui["play_order"].as_signed_integer(), Some(1));
+        for flag in ["is_reversed", "shuffle_items", "has_been_shuffled"] {
+            assert_eq!(ui[flag].as_boolean(), Some(false));
+        }
+        let members = op["item_to_container"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].as_signed_integer(), Some(id as i64));
+    }
+
+    #[test]
+    fn insert_playlist_refuses_unidentified_or_invalid_members() {
+        let catalog = crate::test_support::catalogue::collection_catalog(40);
+        let id = catalog.tracks()[0].sync_id;
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        for (pid, name, members) in [
+            (0, "Test", vec![id]),
+            (catalog.primary_container_pid(), "Test", vec![id]),
+            (1234, "", vec![id]),
+            (1234, "Line\nBreak", vec![id]),
+            (1234, "Test", vec![]),
+            (1234, "Test", vec![id,id]),
+            (1234, "Test", vec![0]),
+            (1234, "Test", vec![123456]),
+        ] {
+            assert!(
+                insert_playlist(&catalog, pid, name, &members, time).is_err(),
+                "must refuse pid {pid} name {name:?} members {members:?}"
+            );
+        }
+    }
+
+    #[test]
     fn one_removal_file_holds_at_most_499_tracks_or_playlists() {
         let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         let tracks: Vec<Track> = (1..=500).map(track).collect();
