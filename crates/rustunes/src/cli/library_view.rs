@@ -485,13 +485,42 @@ mod tests {
         let mut out = Vec::new();
         write_playlists(&report, false, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("PLAYLISTS WITH MUSIC (1)"));
-        assert!(text.contains("OTHER CONTAINERS (1)"));
+        assert!(text.contains("PLAYLISTS  (1)"));
+        assert!(text.contains("BUILT-IN / LIBRARY CONTAINERS  (1)"));
         assert!(text.contains("pancakes [primary]"));
         assert!(text.contains("2,643"));
-        assert!(text.contains("FAVORITES  1,594"));
-        assert!(text.contains("18 albums have no artist link (38 tracks)"));
+        assert!(text.contains("1,594 favorites"));
+        assert!(text.contains("18 albums have no artist link (38 tracks affected)"));
         assert!(!text.contains("Raw liked_state breakdown"));
+    }
+
+    #[test]
+    fn full_playlist_output_separates_built_in_music_and_unmatched_lists() {
+        let report = json!({
+            "playlists": [
+                {"name":"flurbz","music_members":1591,"members":1591,"dangling_members":0,"is_primary_library":false},
+                {"name":"clandestine","music_members":0,"members":2424,"dangling_members":2424,"is_primary_library":false},
+                {"name":"Playback History","music_members":250,"members":251,"dangling_members":1,"is_primary_library":false},
+                {"name":"Voice Memos","music_members":0,"members":0,"dangling_members":0,"is_primary_library":false}
+            ],
+            "favorites":{"candidate_favorite_tracks_liked_state_2":1594},
+            "warnings":[]
+        });
+        let mut out = Vec::new();
+        write_playlists(&report, false, &mut out).unwrap();
+        let display = String::from_utf8(out).unwrap();
+        assert!(display.contains("4 containers"));
+        assert!(display.contains("1 playlists with music"));
+        assert!(display.contains("PLAYLISTS  (1)"));
+        assert!(display.contains("flurbz"));
+        assert!(display.contains("1,591"));
+        assert!(display.contains("PLAYLISTS WITH NO MATCHED MUSIC  (1)"));
+        assert!(display.contains("clandestine"));
+        assert!(display.contains("2,424"));
+        assert!(display.contains("BUILT-IN / LIBRARY CONTAINERS  (2)"));
+        assert!(display.contains("Playback History"));
+        assert!(display.contains("Voice Memos"));
+        assert!(display.contains("Unresolved = membership"));
     }
 
     #[test]
@@ -520,8 +549,8 @@ mod tests {
         assert!(text.contains("1,594"));
         assert!(text.contains("Spacemen 3 — Call The Doctor"));
         assert!(text.contains("Basa Basa — Homowo"));
-        assert!(!text.contains("PLAYLISTS WITH MUSIC"));
-        assert!(!text.contains("OTHER CONTAINERS"));
+        assert!(!text.contains("PLAYLISTS  ("));
+        assert!(!text.contains("BUILT-IN / LIBRARY CONTAINERS"));
     }
 
     #[test]
