@@ -366,16 +366,30 @@ impl AttemptStorage {
         attempt.check(&self.directory)?;
         let from = component(&attempt.name)?;
         let to = component(&self.target)?;
-        // SAFETY: live owned descriptors, NUL-terminated single components and
-        // Linux RENAME_NOREPLACE prevent replacing any existing target entry.
+        // SAFETY: live owned descriptors and NUL-terminated single components.
+        // Both platforms use an atomic no-replace rename, never plain renameat
+        // (which could silently replace an existing capture).
         let result = unsafe {
-            libc::renameat2(
-                self.directory.as_raw_fd(),
-                from.as_ptr(),
-                self.parent.as_raw_fd(),
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                libc::renameat2(
+                    self.directory.as_raw_fd(),
+                    from.as_ptr(),
+                    self.parent.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            }
+            #[cfg(target_os = "macos")]
+            {
+                libc::renameatx_np(
+                    self.directory.as_raw_fd(),
+                    from.as_ptr(),
+                    self.parent.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            }
         };
         if result != 0 {
             return Err(std::io::Error::last_os_error())
