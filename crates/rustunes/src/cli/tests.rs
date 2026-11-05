@@ -42,6 +42,32 @@ fn mpeg_keep_text_never_invents_missing_ownership() {
 }
 
 #[test]
+fn playlist_push_requires_an_m3u8_and_explicit_saved_plan_options() {
+    assert!(matches!(
+        Cli::try_parse_from([
+            "tool", "push", "tests/playlist-sync/playlist.m3u8",
+            "--from-plan", "plan.json",
+            "--playlist-name", "Flurb Playlist Test",
+            "--dry-run"
+        ]).unwrap().command,
+        Command::Push {
+            from_plan: Some(_),
+            playlist_name: Some(_),
+            dry_run: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from([
+            "tool", "push", "tests/playlist-sync/playlist.m3u8",
+            "--from-plan", "plan.json",
+            "--playlist-name", "Flurb Playlist Test", "--yes"
+        ]).unwrap().command,
+        Command::Push { yes: true, .. }
+    ));
+}
+
+#[test]
 fn list_cli_supports_summary_json_and_verbose_without_extra_subcommands() {
     assert!(matches!(
         Cli::try_parse_from(["tool", "list"]).unwrap().command,
