@@ -459,6 +459,7 @@ pub fn diagnose_snapshot(
     database: &Path,
     wal: Option<&Path>,
     scratch_parent: &Path,
+    compare_playlist: Option<&str>,
 ) -> Result<serde_json::Value> {
     scratch::with_scratch(scratch_parent, None, |scratch| {
         let db_path = scratch.path().join("MediaLibrary.sqlitedb");
@@ -471,7 +472,7 @@ pub fn diagnose_snapshot(
         scratch.prepare_sql(journal.map(|(_, bytes)| bytes), None)?;
         scratch.check(None)?;
         let connection = open_readonly_checked_options(&db_path, None, true)?;
-        let report = diagnostics::inspect(&connection)?;
+        let report = diagnostics::inspect(&connection, compare_playlist)?;
         drop(connection);
         scratch.check(None)?;
         ensure!(
