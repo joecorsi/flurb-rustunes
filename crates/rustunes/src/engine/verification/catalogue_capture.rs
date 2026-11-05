@@ -271,7 +271,11 @@ where
 
 /// The diagnostic path shares transport, copy, deadline and cleanup safeguards
 /// but never constructs a Catalog that could be passed to a sync planner.
-pub async fn diagnose<F, Fut>(trace: Option<&Path>, connect: F) -> Result<serde_json::Value>
+pub async fn diagnose<F, Fut>(
+    trace: Option<&Path>,
+    compare_playlist: Option<&str>,
+    connect: F,
+) -> Result<serde_json::Value>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DeviceProvider>>,
@@ -288,6 +292,7 @@ where
                 &snapshot.database,
                 snapshot.wal.as_deref(),
                 &scratch.path,
+                compare_playlist,
             );
             // Remove only the empty parent created by this command.
             let cleanup = std::fs::remove_dir(&scratch.path);
