@@ -46,6 +46,37 @@ fn files(path: &Path, value: u8) -> Result<[u8; 32]> {
     Ok(Sha256::digest([value]).into())
 }
 
+#[test]
+fn held_capture_directories_are_addressable_without_linux_procfs() {
+    let temp = Temp::new();
+    // The macOS temp directory may appear under the /var symlink. Use its
+    // canonical parent, as production's preflight runner does.
+    let canonical = fs::canonicalize(&temp.0).unwrap();
+    let trace = canonical.join("before");
+    let storage = AttemptStorage::create(&trace).unwrap();
+    storage.check().unwrap();
+    let storage_path = storage.fd_path().unwrap();
+    assert!(storage_path.is_dir());
+    assert!(!trace.exists());
+
+    let attempt = storage.attempt(1).unwrap();
+    let attempt_path = attempt.fd_path().unwrap();
+    assert!(attempt_path.is_dir());
+    private_write(&attempt_path.join("error.txt"), b"read-only diagnostic").unwrap();
+    assert_eq!(
+        fs::read(canonical.join("before.capture-attempts/attempt-0001/error.txt")).unwrap(),
+        b"read-only diagnostic"
+    );
+    assert!(private_write(&attempt_path.join("error.txt"), b"replace").is_err());
+    attempt.check(&storage.directory).unwrap();
+
+    // The no-replace check must see a dangling symlink as occupied.
+    let target = canonical.join("already-existing");
+    symlink(canonical.join("no-such-target"), &target).unwrap();
+    assert!(ensure_absent(&storage.parent, OsStr::new("already-existing")).is_err());
+    fs::remove_file(target).unwrap();
+}
+
 #[tokio::test]
 async fn one_typed_drift_recaptures_whole_state_without_mixing_or_renewing_deadline() {
     let temp = Temp::new();
