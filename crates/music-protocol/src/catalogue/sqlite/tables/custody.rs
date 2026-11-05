@@ -493,7 +493,14 @@ impl Root {
         loop {
             budget.check()?;
             unsafe {
-                *libc::__errno_location() = 0;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    *libc::__errno_location() = 0;
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    *libc::__error() = 0;
+                }
             }
             let entry = unsafe { libc::readdir(stream.0) };
             if entry.is_null() {
