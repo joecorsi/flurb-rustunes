@@ -280,6 +280,28 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DeviceProvider>>,
 {
+    diagnostic_capture(trace, compare_playlist, false, connect).await
+}
+
+/// Full read-only inventory for list --json (not a sync planning model).
+pub async fn inventory<F, Fut>(connect: F) -> Result<serde_json::Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    diagnostic_capture(None, None, true, connect).await
+}
+
+async fn diagnostic_capture<F, Fut>(
+    trace: Option<&Path>,
+    compare_playlist: Option<&str>,
+    complete: bool,
+    connect: F,
+) -> Result<serde_json::Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
     with_raw_capture_options(
         trace,
         Instant::now() + Duration::from_secs(120),
@@ -288,12 +310,15 @@ where
         connect,
         |snapshot, _| {
             let scratch = CaptureDirectory::create(None)?;
-            let report = music_protocol::catalogue::sqlite::diagnose_snapshot(
-                &snapshot.database,
-                snapshot.wal.as_deref(),
-                &scratch.path,
-                compare_playlist,
-            );
+            let report = if complete {
+                music_protocol::catalogue::sqlite::inventory_snapshot(
+                    &snapshot.database, snapshot.wal.as_deref(), &scratch.path
+                )
+            } else {
+                music_protocol::catalogue::sqlite::diagnose_snapshot(
+                    &snapshot.database, snapshot.wal.as_deref(), &scratch.path, compare_playlist
+                )
+            };
             // Remove only the empty parent created by this command.
             let cleanup = std::fs::remove_dir(&scratch.path);
             let report = report?;
