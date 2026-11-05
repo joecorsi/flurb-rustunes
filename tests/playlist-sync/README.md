@@ -1,31 +1,38 @@
-# Flurb iPhone playlist sync fixture
+# Flurb iPhone playlist test
 
-Run `bash tests/playlist-sync/generate.sh` from the repository root. It
-creates 10 **distinct** six-second MP3 tone files under `generated/`,
-with **ID3v2.3** tags, one album, explicit 1/10 through 10/10 track
-numbers, and unique song titles. The generator verifies every file begins
-with the ID3v2.3 byte sequence (`49 44 33 03`). Requires `ffmpeg` and
-`xxd` on macOS.
+This directory includes **10 committed, playable MP3 files**, each approximately
+five seconds long (5.04 seconds due to MPEG frame boundaries). They contain
+different kinds of synthesized noise: white, pink, brown, blue, violet, velvet,
+low rumble, bright hiss, radio static and wind gust.
 
-`playlist.m3u8` lists their desired order for the test. It is a **local
-test manifest**, not a playlist that rustunes can currently transfer to
-the iPhone.
+All ten are **ID3v2.3** files. They have distinct titles, sequential
+1/10–10/10 track numbers, artist `Flurb Test Artist` and album
+`Flurb Playlist Test`. Each was decoded, checked for a ~5-second duration
+and verified as ID3v2.3 before committing.
 
-Testing stages:
+**No Homebrew, FFmpeg, or generator command is required on your Mac.**
+The audio files are already in `generated/` and tracked by git.
 
-1. Audit the cleared phone with `cargo run -- library stats` and
-   `cargo run -- library playlists`. Stop if unexpected tracks remain.
-2. Run the generator. Push only the generated directory using the existing
-   rustunes `push` command, first in dry-run mode. Verify exactly 10
-   distinct tracks after the transfer.
-3. Use the planned journaled playlist-create command to resolve all 10
-   transferred track sync IDs, create one ordinary playlist via Apple's
-   `insert_playlist`, and verify the exact 10 members in order.
-4. Verify creating/deleting that playlist leaves all ten MP3 tracks intact.
+From the repository root, with the iPhone connected:
 
-A **serializer** for `insert_playlist` exists in
-`music_protocol::catalogue::mutation::insert_playlist`; the journaled
-phone-send and membership verification entry point is not yet implemented.
-Do not use a raw unsigned operation payload as a sync command.
+```sh
+git pull
+cargo run -- library stats
+cargo run -- push tests/playlist-sync/generated --dry-run
+```
 
-The generated files are excluded from git and can be reproduced as needed.
+Only after confirming that the phone has the expected empty baseline and the
+dry run proposes exactly 10 additions:
+
+```sh
+cargo run -- push tests/playlist-sync/generated
+cargo run -- library stats
+```
+
+`playlist.m3u8` is the intended ten-song ordering **for later playlist
+creation**; it is not automatically synchronized by `push`.
+
+Rustunes now has a pure `insert_playlist` operation encoder, but the journaled
+playlist-create CLI, signed transport and after-state membership verification
+are still to be implemented. Do not treat a successful track push as evidence
+that the playlist was created.
