@@ -203,6 +203,17 @@ That's it. From now on, run `rustunes sync` whenever your music folder changes.
 
 ## Everyday use
 
+### List the iPhone library
+
+```bash
+rustunes list                       # track/album totals and playlist names, IDs, counts
+rustunes list --json > library.json # full tracks, albums and ordered playlist membership
+rustunes list --verbose             # show catalogue diagnostic details
+```
+
+`list` is read-only. The normal view never prints every individual track.
+The JSON view is a complete inspection export, not a sync plan.
+
 ### The three main commands
 
 | Command | Sends new tracks | Updates changed tags | Removes tracks | Use it to |
