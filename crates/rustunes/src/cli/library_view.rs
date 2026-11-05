@@ -360,6 +360,61 @@ mod tests {
         assert_eq!(display("name\x1b[31m\n"), "name\\u{1b}[31m\\n");
     }
     #[test]
+    fn playlist_output_is_compact_and_grouped() {
+        let report = json!({
+            "playlists": [
+                {"name":"80s","music_members":18,"members":18,"dangling_members":0,"is_primary_library":false},
+                {"name":"pancakes","music_members":0,"members":2643,"dangling_members":2643,"is_primary_library":true}
+            ],
+            "favorites":{"candidate_favorite_tracks_liked_state_2":1594},
+            "warnings":[
+                {"code":"albums_without_artist","count":18},
+                {"code":"tracks_in_albums_without_artist","count":38}
+            ]
+        });
+        let mut out = Vec::new();
+        write_playlists(&report, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("PLAYLISTS WITH MUSIC (1)"));
+        assert!(text.contains("OTHER CONTAINERS (1)"));
+        assert!(text.contains("pancakes [primary]"));
+        assert!(text.contains("2,643"));
+        assert!(text.contains("FAVORITES  1,594"));
+        assert!(text.contains("18 albums have no artist link (38 tracks)"));
+        assert!(!text.contains("Raw liked_state breakdown"));
+    }
+
+    #[test]
+    fn comparison_view_only_shows_mismatched_tracks() {
+        let report = json!({
+            "playlists":[{"name":"80s","music_members":18}],
+            "favorites_comparison":{
+                "playlist_name":"flurbz",
+                "liked_state_2_tracks":1594,
+                "playlist_synced_music_tracks":1591,
+                "overlap":1591,
+                "favorite_not_in_playlist":[
+                    {"artist":"Spacemen 3","title":"Call The Doctor"},
+                    {"artist":"Basa Basa","title":"Homowo"}
+                ],
+                "playlist_not_favorited":[],
+                "playlist_unmatched_members":0,
+                "duplicate_membership_rows":0
+            },
+            "warnings":[]
+        });
+        let mut out = Vec::new();
+        write_playlists(&report, true, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("FAVORITES vs flurbz"));
+        assert!(text.contains("1,594"));
+        assert!(text.contains("Spacemen 3 — Call The Doctor"));
+        assert!(text.contains("Basa Basa — Homowo"));
+        assert!(!text.contains("PLAYLISTS WITH MUSIC"));
+        assert!(!text.contains("OTHER CONTAINERS"));
+    }
+
+    #[test]
     fn json_filters_and_missing_id_are_explicit() {
         let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
         let mut out = Vec::new();
