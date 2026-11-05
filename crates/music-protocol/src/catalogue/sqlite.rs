@@ -39,6 +39,7 @@ pub const USER_VERSION_FLOOR: i64 = 2_400_060;
 pub const TESTED_USER_VERSIONS: &[i64] = &[2_400_060, 2_410_000];
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 mod scratch;
+mod diagnostics;
 pub mod tables;
 mod without;
 
@@ -450,6 +451,42 @@ pub fn read_snapshot(
 ) -> Result<Catalog> {
     read_snapshot_checked(database, wal, scratch_parent, None)
 }
+/// A best-effort inventory of a saved copy. Unlike `Catalog`, the report
+/// never supplies a normalized track model to a synchronization planner.
+/// Missing relational data is counted rather than guessed or repaired.
+pub fn diagnose_snapshot(
+    database: &Path,
+    wal: Option<&Path>,
+    scratch_parent: &Path,
+) -> Result<serde_json::Value> {
+    scratch::with_scratch(scratch_parent, None, |scratch| {
+        let db_path = scratch.path().join("MediaLibrary.sqlitedb");
+        let wal_path = scratch.path().join("MediaLibrary.sqlitedb-wal");
+        let db = scratch.copy(database, "MediaLibrary.sqlitedb", MAX_DATABASE_BYTES, None)?;
+        let journal = wal
+            .map(|path| scratch.copy(path, "MediaLibrary.sqlitedb-wal", MAX_WAL_BYTES, None))
+            .transpose()?;
+        validate_container(&db_path, journal.as_ref().map(|_| wal_path.as_path()))?;
+        scratch.prepare_sql(journal.map(|(_, bytes)| bytes), None)?;
+        scratch.check(None)?;
+        let connection = open_readonly_checked_options(&db_path, None, true)?;
+        let report = diagnostics::inspect(&connection)?;
+        drop(connection);
+        scratch.check(None)?;
+        ensure!(
+            hash_file(database, MAX_DATABASE_BYTES)? == db,
+            "source database changed during diagnostic read"
+        );
+        if let (Some(source), Some(expected)) = (wal, journal) {
+            ensure!(
+                hash_file(source, MAX_WAL_BYTES)? == expected,
+                "source WAL changed during diagnostic read"
+            );
+        }
+        Ok(report)
+    })
+}
+
 /// Read with an explicit shared cancellation flag and absolute deadline.
 /// Policy is checked during private copying, SQLite work and result collection.
 pub fn read_snapshot_with_control(
