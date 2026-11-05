@@ -42,6 +42,23 @@ fn mpeg_keep_text_never_invents_missing_ownership() {
 }
 
 #[test]
+fn list_cli_supports_summary_json_and_verbose_without_extra_subcommands() {
+    assert!(matches!(
+        Cli::try_parse_from(["tool", "list"]).unwrap().command,
+        Command::List { json: false }
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["tool", "list", "--json", "--verbose"]).unwrap().command,
+        Command::List { json: true }
+    ));
+    assert!(Cli::try_parse_from(["tool", "list", "tracks"]).is_err());
+    assert!(Cli::try_parse_from(["tool", "list", "--limit", "50"]).is_err());
+    assert!(super::reaches_phone(
+        &Cli::try_parse_from(["tool", "list"]).unwrap().command
+    ));
+}
+
+#[test]
 fn nested_help_and_completions_need_no_local_state() {
     for args in [
         vec!["tool", "cache", "--help"],
