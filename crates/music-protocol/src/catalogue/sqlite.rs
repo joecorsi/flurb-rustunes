@@ -286,8 +286,9 @@ pub struct ArtworkInventory {
 }
 
 impl ArtworkInventory {
-    /// Union of canonical source300 IDs in BOTH artwork and artwork_token.
-    /// Historical cached IDs and other relation shapes are never omitted.
+    /// Union of source300 numeric IDs in BOTH artwork and artwork_token.
+    /// On an otherwise empty music library, stale reserved/noncanonical IDs
+    /// are also held as occupied (but not treated as usable artwork).
     pub fn occupied_cache_ids(&self) -> &BTreeSet<u32> {
         &self.occupied_cache_ids
     }
