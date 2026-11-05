@@ -561,7 +561,11 @@ enum LibraryCommand {
     /// Show track, album, artist, size and artwork registration totals.
     Stats,
     /// List device playlists with raw membership counts and the liked-state breakdown.
-    Playlists,
+    Playlists {
+        /// Compare one smart playlist's members with tracks where liked_state=2.
+        #[arg(long, value_name = "NAME")]
+        compare_favorites: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1486,9 +1490,13 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
         } => {
             // A read-only inventory must not require the strict track model used
             // for planning writes. Surface broken joins as warnings instead.
-            if matches!(&view, LibraryCommand::Stats | LibraryCommand::Playlists) && snapshot.is_none() {
-                let playlists_view = matches!(&view, LibraryCommand::Playlists);
-                let report = catalogue_capture::diagnose(trace_dir.as_deref(), device::provider).await?;
+            if matches!(&view, LibraryCommand::Stats | LibraryCommand::Playlists { .. }) && snapshot.is_none() {
+                let playlists_view = matches!(&view, LibraryCommand::Playlists { .. });
+                let compare_playlist = match &view {
+                    LibraryCommand::Playlists { compare_favorites } => compare_favorites.as_deref(),
+                    _ => None,
+                };
+                let report = catalogue_capture::diagnose(trace_dir.as_deref(), compare_playlist, device::provider).await?;
                 if machine::enabled() {
                     machine::report(if playlists_view { "library_playlists" } else { "library_stats" }, &report)?;
                 } else {
@@ -1531,6 +1539,50 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                             writeln!(output)?;
                         }
                         writeln!(output, "Favorite-state mapping is provisional until checked against the Music app.")?;
+                        if let Some(comparison) = report.get("favorites_comparison") {
+                            if let Some(error) = comparison["error"].as_str() {
+                                writeln!(output, "Favorites comparison could not complete: {error}")?;
+                            } else {
+                                let label = serde_json::to_string(
+                                    comparison["playlist_name"].as_str().unwrap_or("(unnamed)")
+                                )?;
+                                writeln!(
+                                    output,
+                                    "Comparison with {label}: {} playlist music tracks, {} liked_state=2 tracks, {} in both",
+                                    comparison["playlist_synced_music_tracks"],
+                                    comparison["liked_state_2_tracks"],
+                                    comparison["overlap"],
+                                )?;
+                                writeln!(
+                                    output,
+                                    "  {} unmatched membership IDs; {} duplicate membership rows",
+                                    comparison["playlist_unmatched_members"],
+                                    comparison["duplicate_membership_rows"],
+                                )?;
+                                for (field, title) in [
+                                    ("favorite_not_in_playlist", "Favorited tracks NOT in playlist"),
+                                    ("playlist_not_favorited", "Playlist tracks NOT marked favorite"),
+                                ] {
+                                    if let Some(rows) = comparison[field].as_array() {
+                                        writeln!(output, "{title}: {}", rows.len())?;
+                                        for track in rows {
+                                            let artist = serde_json::to_string(
+                                                track["artist"].as_str().unwrap_or("(artist unknown)")
+                                            )?;
+                                            let song = serde_json::to_string(
+                                                track["title"].as_str().unwrap_or("(title unknown)")
+                                            )?;
+                                            writeln!(
+                                                output,
+                                                "  {artist} — {song} (track {}, liked_state={})",
+                                                track["sync_id"],
+                                                track["liked_state"],
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(warnings) = report["warnings"].as_array() {
                             for warning in warnings {
                                 writeln!(output, "Diagnostic: {}", warning)?;
@@ -1592,7 +1644,7 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                 }),
                 LibraryCommand::Show { id } => library_view::View::Show(id),
                 LibraryCommand::Stats => library_view::View::Stats,
-                LibraryCommand::Playlists => anyhow::bail!("offline snapshot playlist diagnostics not supported; connect the iPhone"),
+                LibraryCommand::Playlists { .. } => anyhow::bail!("offline snapshot playlist diagnostics not supported; connect the iPhone"),
             };
             let catalog = if let Some(directory) = snapshot {
                 let line = "Reading saved snapshot; no live device check";
