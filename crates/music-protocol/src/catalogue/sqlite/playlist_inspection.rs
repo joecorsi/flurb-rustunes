@@ -1,7 +1,9 @@
 //! Best-effort read-only playlist membership and liked-state inspection.
 //! Raw container IDs and membership rows are reported as stored; no
 //! inferences are used by synchronization or transfer logic.
+use anyhow::{Context, Result, ensure};
 use rusqlite::Connection;
+use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 
 const MAX_PLAYLIST_ROWS: usize = 10_000;
@@ -146,6 +148,116 @@ pub(super) fn inspect(connection: &Connection) -> (Value, Value, Vec<Value>) {
         "note": "Favorites are provisionally mapped to liked_state=2; raw values are included for validation."
     });
     (Value::Array(playlists), favorites, warnings)
+}
+
+
+const COMPARE_TRACK_LIMIT: usize = 50_000;
+const COMPARE_MEMBER_LIMIT: usize = 50_000;
+
+/// Compare a named playlist's actual members to the raw liked_state=2 track set.
+/// All values are read from a captured SQLite copy, never fed to sync planning.
+pub(super) fn compare_favorites(connection: &Connection, name: &str) -> Value {
+    match compare_favorites_inner(connection, name) {
+        Ok(value) => value,
+        Err(error) => json!({
+            "playlist_name": name,
+            "error": format!("{error:#}"),
+        }),
+    }
+}
+
+fn compare_favorites_inner(connection: &Connection, name: &str) -> Result<Value> {
+    let mut statement = connection.prepare(
+        "SELECT container_pid FROM container WHERE name=?1 ORDER BY container_pid LIMIT 2",
+    )?;
+    let mut rows = statement.query([name])?;
+    let Some(row) = rows.next()? else {
+        return Ok(json!({"playlist_name": name, "error": "playlist not found"}));
+    };
+    let container_pid: i64 = row.get(0)?;
+    ensure!(
+        rows.next()?.is_none(),
+        "multiple playlists are named {name:?}; select an unambiguous name"
+    );
+    drop(rows);
+    drop(statement);
+
+    // SQL's internal item_pid joins playlist membership and the stats table.
+    // sync_id is only for identifying tracks in the resulting report.
+    let mut tracks = BTreeMap::<i64, Value>::new();
+    let mut favorite_ids = BTreeSet::<i64>::new();
+    let mut statement = connection.prepare(
+        "SELECT i.item_pid, s.sync_id, e.title, ia.item_artist, st.liked_state
+         FROM item i
+         JOIN item_store s ON s.item_pid=i.item_pid
+         LEFT JOIN item_extra e ON e.item_pid=i.item_pid
+         LEFT JOIN item_artist ia ON ia.item_artist_pid=i.item_artist_pid
+         LEFT JOIN item_stats st ON st.item_pid=i.item_pid
+         WHERE i.media_type=8 AND s.sync_id<>0"
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        ensure!(tracks.len() < COMPARE_TRACK_LIMIT, "track comparison row limit exceeded");
+        let item_pid: i64 = row.get(0)?;
+        let sync_id: i64 = row.get(1)?;
+        let title: Option<String> = row.get(2)?;
+        let artist: Option<String> = row.get(3)?;
+        let liked_state: Option<i64> = row.get(4)?;
+        let info = json!({
+            "item_pid": item_pid.to_string(),
+            "sync_id": (sync_id as u64).to_string(),
+            "title": title,
+            "artist": artist,
+            "liked_state": liked_state,
+        });
+        ensure!(tracks.insert(item_pid, info).is_none(), "duplicate track identity");
+        if liked_state == Some(2) {
+            favorite_ids.insert(item_pid);
+        }
+    }
+    drop(rows);
+    drop(statement);
+
+    let mut members = BTreeSet::<i64>::new();
+    let mut membership_rows = 0usize;
+    let mut statement = connection.prepare(
+        "SELECT item_pid FROM container_item WHERE container_pid=?1"
+    )?;
+    let mut rows = statement.query([container_pid])?;
+    while let Some(row) = rows.next()? {
+        ensure!(
+            membership_rows < COMPARE_MEMBER_LIMIT,
+            "playlist membership comparison row limit exceeded"
+        );
+        let item_pid: i64 = row.get(0)?;
+        members.insert(item_pid);
+        membership_rows += 1;
+    }
+
+    let track_ids: BTreeSet<_> = tracks.keys().copied().collect();
+    let playlist_music_ids: BTreeSet<_> = members.intersection(&track_ids).copied().collect();
+    let overlap = favorite_ids.intersection(&playlist_music_ids).count();
+    let favorite_not_in_playlist: Vec<_> = favorite_ids
+        .difference(&playlist_music_ids)
+        .filter_map(|id| tracks.get(id).cloned())
+        .collect();
+    let playlist_not_favorited: Vec<_> = playlist_music_ids
+        .difference(&favorite_ids)
+        .filter_map(|id| tracks.get(id).cloned())
+        .collect();
+    Ok(json!({
+        "playlist_name": name,
+        "container_pid": container_pid.to_string(),
+        "playlist_membership_rows": membership_rows,
+        "playlist_unique_members": members.len(),
+        "playlist_synced_music_tracks": playlist_music_ids.len(),
+        "playlist_unmatched_members": members.difference(&track_ids).count(),
+        "duplicate_membership_rows": membership_rows - members.len(),
+        "liked_state_2_tracks": favorite_ids.len(),
+        "overlap": overlap,
+        "favorite_not_in_playlist": favorite_not_in_playlist,
+        "playlist_not_favorited": playlist_not_favorited,
+    }))
 }
 
 #[cfg(test)]
