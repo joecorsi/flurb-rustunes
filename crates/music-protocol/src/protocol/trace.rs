@@ -44,7 +44,7 @@ pub fn private_file(path: &Path) -> Result<fs::File> {
                     name.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
                         | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    0o600 as libc::mode_t,
+                    0o600 as libc::c_uint,
                 )
             };
             if fd < 0 {
