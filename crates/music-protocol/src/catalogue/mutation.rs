@@ -1,5 +1,5 @@
-//! Pure native title update and ordinary deletion envelopes for tracks,
-//! unfilled rows and playlists.
+//! Pure native track metadata edits, removals and ordinary playlist creation.
+//! Playlist operations are encoded here but never sent from this module.
 //!
 //! These bytes do not establish ownership or authorize deletion. The caller
 //! selects permitted targets, binds a fresh catalog/identity/readback snapshot,
