@@ -1,7 +1,7 @@
 //! Best-effort read-only playlist membership and liked-state inspection.
 //! Raw container IDs and membership rows are reported as stored; no
 //! inferences are used by synchronization or transfer logic.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
