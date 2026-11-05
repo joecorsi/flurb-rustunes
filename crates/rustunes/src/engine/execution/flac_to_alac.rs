@@ -701,13 +701,15 @@ fn run(
     output: Option<&mut (u64, Sha256)>,
     abandoned: &dyn Fn() -> bool,
 ) -> Result<()> {
-    // FFmpeg dies with this thread, which waits for it, so it never outlives
-    // a killed run.
+    // Linux can kill FFmpeg if the parent process dies unexpectedly.
+    // macOS lacks PR_SET_PDEATHSIG: ordinary error/timeout paths still
+    // kill and wait for the child, but a forcibly killed parent may leave it.
     let parent = std::process::id();
     // SAFETY: the closure runs between fork and exec and makes only
     // async-signal-safe system calls, allocating nothing.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(io::Error::last_os_error());
             }
