@@ -238,6 +238,79 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DeviceProvider>>,
 {
+    with_raw_capture_options(trace, deadline, control, nested, connect, |snapshot, control| {
+        let catalog =
+            parse_copied_snapshot_options(&snapshot.database, snapshot.wal.as_deref(), control)?;
+        let verified = catalog.source_hashes();
+        ensure!(
+            verified.database == snapshot.hashes[0].2
+                && verified.database_bytes == snapshot.hashes[0].1,
+            "local catalog database changed during parsing"
+        );
+        let wal = snapshot.hashes.get(1);
+        ensure!(
+            verified.wal == wal.map(|entry| entry.2)
+                && verified.wal_bytes == wal.map(|entry| entry.1),
+            "local catalog WAL changed during parsing"
+        );
+        check_control(control)?;
+        let untested = (!catalog.user_version_tested()).then(|| catalog.user_version());
+        if let Some(version) = untested
+            && WARNED_VERSION.swap(version, Ordering::Relaxed) != version
+        {
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::UntestedCatalogueVersion(version),
+            ))?;
+        }
+        let value = consume(catalog)?;
+        check_control(control)?;
+        Ok((value, untested))
+    })
+    .await
+}
+
+/// The diagnostic path shares transport, copy, deadline and cleanup safeguards
+/// but never constructs a Catalog that could be passed to a sync planner.
+pub async fn diagnose<F, Fut>(trace: Option<&Path>, connect: F) -> Result<serde_json::Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    with_raw_capture_options(
+        trace,
+        Instant::now() + Duration::from_secs(120),
+        None,
+        false,
+        connect,
+        |snapshot, _| {
+            let scratch = CaptureDirectory::create(None)?;
+            let report = music_protocol::catalogue::sqlite::diagnose_snapshot(
+                &snapshot.database,
+                snapshot.wal.as_deref(),
+                &scratch.path,
+            );
+            // Remove only the empty parent created by this command.
+            let cleanup = std::fs::remove_dir(&scratch.path);
+            let report = report?;
+            cleanup.context("remove diagnostic scratch parent")?;
+            Ok((report, None))
+        },
+    )
+    .await
+}
+
+async fn with_raw_capture_options<F, Fut, T>(
+    trace: Option<&Path>,
+    deadline: Instant,
+    control: Option<&CaptureControl>,
+    nested: bool,
+    connect: F,
+    process: impl FnOnce(&Captured, Option<&CaptureControl>) -> Result<(T, Option<i64>)>,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
     check_control(control)?;
     let capture = CaptureDirectory::create(trace)?;
     check_control(control)?;
@@ -290,30 +363,7 @@ where
             .context("catalog AFC connection deadline")??
         };
         let snapshot = capture_client(afc, &capture.path, deadline, control).await?;
-        let catalog =
-            parse_copied_snapshot_options(&snapshot.database, snapshot.wal.as_deref(), control)?;
-        let verified = catalog.source_hashes();
-        ensure!(
-            verified.database == snapshot.hashes[0].2
-                && verified.database_bytes == snapshot.hashes[0].1,
-            "local catalog database changed during parsing"
-        );
-        let wal = snapshot.hashes.get(1);
-        ensure!(
-            verified.wal == wal.map(|entry| entry.2)
-                && verified.wal_bytes == wal.map(|entry| entry.1),
-            "local catalog WAL changed during parsing"
-        );
-        check_control(control)?;
-        let untested = (!catalog.user_version_tested()).then(|| catalog.user_version());
-        if let Some(version) = untested
-            && WARNED_VERSION.swap(version, Ordering::Relaxed) != version
-        {
-            crate::engine::observe(crate::engine::Event::Observation(
-                crate::engine::Observation::UntestedCatalogueVersion(version),
-            ))?;
-        }
-        let value = consume(catalog)?;
+        let (value, untested) = process(&snapshot, control)?;
         check_control(control)?;
         Ok((value, untested))
     }
