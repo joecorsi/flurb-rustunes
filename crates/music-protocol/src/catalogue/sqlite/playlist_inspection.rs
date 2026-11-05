@@ -297,4 +297,57 @@ mod tests {
         assert_eq!(favorites["candidate_favorite_tracks_liked_state_2"], 0);
         assert!(warnings.iter().any(|entry| entry["code"] == "playlist_query_error"));
     }
+
+    #[test]
+    fn compare_favorite_membership_in_both_directions() {
+        let fixture = Fixture::new(false);
+        fixture.connection.execute_batch(
+            "ALTER TABLE container ADD COLUMN name TEXT;
+             UPDATE container SET name='flurbz' WHERE container_pid=81;
+             CREATE TABLE container_item(
+                 container_item_pid INTEGER PRIMARY KEY,
+                 container_pid INTEGER, item_pid INTEGER, position INTEGER
+             );
+             INSERT INTO container_item VALUES(1,81,1,0);
+             INSERT INTO item SELECT 2,media_type,album_pid,album_artist_pid,
+                 item_artist_pid,genre_id,composer_pid,base_location_id,remote_location_id,
+                 track_number,disc_number,is_compilation,composer_order
+                 FROM item WHERE item_pid=1;
+             INSERT INTO item_store VALUES(2,-2);
+             INSERT INTO item_extra SELECT 2,title,'SECOND.m4a',total_time_ms,file_size,
+                 track_count,disc_count,year,copyright,content_rating,
+                 content_rating_level,sort_title,comment FROM item_extra WHERE item_pid=1;
+             INSERT INTO item_stats VALUES(2,0,0,0,0,0,0,0,2);"
+        ).unwrap();
+        let result = compare_favorites(&fixture.connection, "flurbz");
+        assert!(result.get("error").is_none(), "{result:?}");
+        assert_eq!(result["playlist_synced_music_tracks"], 1);
+        assert_eq!(result["liked_state_2_tracks"], 1);
+        assert_eq!(result["overlap"], 0);
+        assert_eq!(result["favorite_not_in_playlist"][0]["item_pid"], "2");
+        assert_eq!(result["playlist_not_favorited"][0]["item_pid"], "1");
+
+        fixture.connection.execute_batch(
+            "UPDATE item_stats SET liked_state=2 WHERE item_pid=1;"
+        ).unwrap();
+        let updated = compare_favorites(&fixture.connection, "flurbz");
+        assert_eq!(updated["overlap"], 1);
+        assert_eq!(updated["favorite_not_in_playlist"].as_array().unwrap().len(), 1);
+        assert_eq!(updated["playlist_not_favorited"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn comparison_reports_missing_or_ambiguous_playlist_names() {
+        let fixture = Fixture::new(false);
+        let missing = compare_favorites(&fixture.connection, "flurbz");
+        assert!(missing["error"].as_str().unwrap().contains("no such column"));
+        fixture.connection.execute_batch(
+            "ALTER TABLE container ADD COLUMN name TEXT;
+             UPDATE container SET name='flurbz' WHERE container_pid=81;
+             INSERT INTO container VALUES(82,-82,'flurbz');"
+        ).unwrap();
+        let ambiguous = compare_favorites(&fixture.connection, "flurbz");
+        assert!(ambiguous["error"].as_str().unwrap().contains("multiple playlists"));
+    }
+
 }
