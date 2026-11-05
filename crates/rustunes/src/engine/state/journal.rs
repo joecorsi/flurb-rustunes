@@ -1021,7 +1021,21 @@ impl ReadOnlyCopy {
     }
 
     fn connect(&self) -> Result<Connection> {
-        let connection = connect_existing(&self.directory.join(DB_NAME), true)?;
+        // macOS commonly reports its temporary directory under /var/folders,
+        // but /var is a symlink to /private/var. SQLite's OPEN_NOFOLLOW checks
+        // path components, not just the final journal.sqlite file. Resolve the
+        // disposable copy's real path first; never canonicalize/open the live
+        // journal here. The temp copy is ours, under a private 0700 directory.
+        let path = fs::canonicalize(self.directory.join(DB_NAME))
+            .context("resolve private journal inspection copy for SQLite nofollow")?;
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.permissions().mode() & 0o777 == 0o600,
+            "journal inspection copy must be a private regular file"
+        );
+        let connection = connect_existing(&path, true)?;
         connection.pragma_update(None, "query_only", true)?;
         let mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         ensure!(
