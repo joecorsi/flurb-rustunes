@@ -1,3 +1,7 @@
+// The CLI's nested async dispatch exceeds the default compiler query depth
+// in unoptimised builds on some toolchains.
+#![recursion_limit = "256"]
+
 /// The command runs on its own thread with this stack. An unoptimised build
 /// gives each awaited future of a command its own stack frame copies, and a
 /// debug `validate` or `sync` passed the main thread's 8 MiB;
