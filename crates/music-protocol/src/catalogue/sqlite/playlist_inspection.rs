@@ -20,6 +20,8 @@ pub(super) fn inspect(connection: &Connection) -> (Value, Value, Vec<Value>) {
                COALESCE(m.synced_music_members,0), COALESCE(m.dangling_members,0),
                CASE WHEN c.container_pid = (
                     SELECT primary_container_pid FROM db_info LIMIT 1
+               ) OR c.sync_id = (
+                    SELECT primary_container_pid FROM db_info LIMIT 1
                ) THEN 1 ELSE 0 END
         FROM container c
         LEFT JOIN (
@@ -170,7 +172,7 @@ mod tests {
         assert_eq!(rows[0]["members"], 1);
         assert_eq!(rows[0]["name"], "Favorites");
         assert_eq!(rows[1]["name"], "Primary Library");
-        assert_eq!(rows[1]["is_primary_library"], false); // fixture's db_info primary ID is -11
+        assert_eq!(rows[1]["is_primary_library"], true); // matches the fixture's wire PID -11
         assert_eq!(favorites["candidate_favorite_tracks_liked_state_2"], 1);
         assert_eq!(favorites["liked_state_counts"][0]["state"], 2);
     }
