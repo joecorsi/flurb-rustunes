@@ -79,3 +79,42 @@ pub(super) fn inspect(connection: &Connection) -> Result<Value> {
     report["warnings"] = json!(warnings);
     Ok(report)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::catalogue::Fixture;
+
+    #[test]
+    fn missing_album_artist_is_reported_without_synthesizing_one() {
+        let fixture = Fixture::new(false);
+        fixture
+            .connection
+            .execute_batch("UPDATE album SET album_artist_pid=0 WHERE album_pid=31")
+            .unwrap();
+        let report = inspect(&fixture.connection).unwrap();
+        assert_eq!(report["stats"]["tracks"], 1);
+        let warnings = report["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|issue| {
+            issue["code"] == "albums_without_artist" && issue["count"] == 1
+        }));
+        assert!(warnings.iter().any(|issue| {
+            issue["code"] == "tracks_in_albums_without_artist" && issue["count"] == 1
+        }));
+        let pid: i64 = fixture.connection
+            .query_row("SELECT album_artist_pid FROM album WHERE album_pid=31", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pid, 0);
+    }
+
+    #[test]
+    fn unexpected_schema_is_a_diagnostic_instead_of_a_parser_failure() {
+        let fixture = Fixture::new(false);
+        fixture.connection.execute_batch("DROP TABLE album_artist").unwrap();
+        let report = inspect(&fixture.connection).unwrap();
+        assert_eq!(report["stats"]["tracks"], 1);
+        assert!(report["warnings"].as_array().unwrap().iter().any(|issue| {
+            issue["code"] == "albums_without_artist" && issue.get("query_error").is_some()
+        }));
+    }
+}
