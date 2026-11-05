@@ -1097,7 +1097,7 @@ fn open_readonly_checked_options(
                 Authorization::Allow
             }
             AuthAction::Function { function_name }
-                if ["count", "typeof"].contains(&function_name) =>
+                if ["count", "typeof", "sum", "coalesce"].contains(&function_name) =>
             {
                 Authorization::Allow
             }
