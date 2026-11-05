@@ -94,6 +94,83 @@ pub fn delete_playlists(
     prepare_playlists(catalog_identity(catalog), containers, timestamp)
 }
 
+/// Build the confirmed ordinary-playlist creation envelope. This is a pure
+/// serializer, not permission to stage a session: the caller must reserve an
+/// unused playlist PID from a fresh device snapshot, journal intent, and verify
+/// the receiver's container and exact ordered members after sending.
+///
+/// Member identities are sync IDs (the wire PIDs in item_store), never SQLite
+/// item row IDs. The first integration is deliberately limited to nonempty
+/// ordinary playlists with unique existing local music tracks.
+pub fn insert_playlist(
+    catalog: &Catalog,
+    playlist_pid: u64,
+    name: &str,
+    ordered_track_sync_ids: &[u64],
+    timestamp: SystemTime,
+) -> Result<Vec<u8>> {
+    let identity = catalog_identity(catalog);
+    ensure!(
+        identity.database != 0 && identity.primary_container != 0,
+        "missing current catalog identity"
+    );
+    ensure!(
+        playlist_pid != 0
+            && playlist_pid != identity.database
+            && playlist_pid != identity.primary_container,
+        "playlist PID is zero or a reserved library identifier"
+    );
+    ensure!(
+        !name.trim().is_empty()
+            && name.len() <= 255
+            && !name.chars().any(char::is_control),
+        "playlist name must be nonempty, at most 255 bytes, without control characters"
+    );
+    ensure!(
+        !ordered_track_sync_ids.is_empty() && ordered_track_sync_ids.len() <= 499,
+        "initial test playlist must contain 1..=499 tracks"
+    );
+    let mut members = Vec::with_capacity(ordered_track_sync_ids.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for sync_id in ordered_track_sync_ids {
+        ensure!(
+            *sync_id != 0 && seen.insert(*sync_id),
+            "playlist track identity is zero or duplicated"
+        );
+        let track = target(catalog.tracks(), *sync_id)?;
+        validate_local_track(track)?;
+        members.push(Value::Integer((*sync_id as i64).into()));
+    }
+
+    let mut container = Dictionary::new();
+    container.insert("name".into(), name.into());
+    container.insert("date_created".into(), Value::Date(timestamp.into()));
+    container.insert("date_modified".into(), Value::Date(timestamp.into()));
+    let mut ui = Dictionary::new();
+    ui.insert("play_order".into(), 1.into());
+    ui.insert("album_field_order".into(), 0.into());
+    ui.insert("repeat_mode".into(), 0.into());
+    ui.insert("is_reversed".into(), false.into());
+    ui.insert("shuffle_items".into(), false.into());
+    ui.insert("has_been_shuffled".into(), false.into());
+
+    let mut operation = Dictionary::new();
+    operation.insert("operation".into(), "insert_playlist".into());
+    operation.insert("pid".into(), (playlist_pid as i64).into());
+    operation.insert("container".into(), Value::Dictionary(container));
+    operation.insert("container_ui".into(), Value::Dictionary(ui));
+    operation.insert("item_to_container".into(), Value::Array(members));
+    let revision = identity
+        .anchor
+        .checked_add(1)
+        .context("Media anchor exhausted")?;
+    envelope(
+        revision,
+        timestamp,
+        vec![db_info_update(&identity), Value::Dictionary(operation)],
+    )
+}
+
 fn prepare_playlists(
     catalog: CatalogIdentity,
     containers: &[u64],
