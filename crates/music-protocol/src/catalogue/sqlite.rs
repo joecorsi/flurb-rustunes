@@ -462,6 +462,25 @@ pub fn diagnose_snapshot(
     scratch_parent: &Path,
     compare_playlist: Option<&str>,
 ) -> Result<serde_json::Value> {
+    diagnose_snapshot_inner(database, wal, scratch_parent, compare_playlist, false)
+}
+
+/// Complete read-only inventory for inspection, not sync planning.
+pub fn inventory_snapshot(
+    database: &Path,
+    wal: Option<&Path>,
+    scratch_parent: &Path,
+) -> Result<serde_json::Value> {
+    diagnose_snapshot_inner(database, wal, scratch_parent, None, true)
+}
+
+fn diagnose_snapshot_inner(
+    database: &Path,
+    wal: Option<&Path>,
+    scratch_parent: &Path,
+    compare_playlist: Option<&str>,
+    full_inventory: bool,
+) -> Result<serde_json::Value> {
     scratch::with_scratch(scratch_parent, None, |scratch| {
         let db_path = scratch.path().join("MediaLibrary.sqlitedb");
         let wal_path = scratch.path().join("MediaLibrary.sqlitedb-wal");
@@ -473,7 +492,7 @@ pub fn diagnose_snapshot(
         scratch.prepare_sql(journal.map(|(_, bytes)| bytes), None)?;
         scratch.check(None)?;
         let connection = open_readonly_checked_options(&db_path, None, true)?;
-        let report = diagnostics::inspect(&connection, compare_playlist)?;
+        let report = diagnostics::inspect(&connection, compare_playlist, full_inventory)?;
         drop(connection);
         scratch.check(None)?;
         ensure!(
