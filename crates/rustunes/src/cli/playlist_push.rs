@@ -172,7 +172,7 @@ fn journal_track(
         })
         .collect();
     let path_candidates: Vec<u64> = journal.sources.iter()
-        .filter(|(_, recorded)| recorded == &path)
+        .filter(|(_, recorded)| recorded.as_path() == path)
         .map(|(id, _)| *id)
         .collect();
     ensure!(
