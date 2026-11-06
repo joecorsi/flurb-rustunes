@@ -42,17 +42,14 @@ fn mpeg_keep_text_never_invents_missing_ownership() {
 }
 
 #[test]
-fn playlist_push_requires_an_m3u8_and_explicit_saved_plan_options() {
+fn playlist_push_uses_m3u8_directly_without_a_saved_plan() {
     assert!(matches!(
         Cli::try_parse_from([
-            "tool", "push", "tests/playlist-sync/playlist.m3u8",
-            "--from-plan", "plan.json",
-            "--playlist-name", "Flurb Playlist Test",
-            "--dry-run"
+            "tool", "push", "tests/playlist-sync/playlist.m3u8", "--dry-run"
         ]).unwrap().command,
         Command::Push {
-            from_plan: Some(_),
-            playlist_name: Some(_),
+            path: Some(_),
+            playlist_name: None,
             dry_run: true,
             ..
         }
@@ -60,11 +57,18 @@ fn playlist_push_requires_an_m3u8_and_explicit_saved_plan_options() {
     assert!(matches!(
         Cli::try_parse_from([
             "tool", "push", "tests/playlist-sync/playlist.m3u8",
-            "--from-plan", "plan.json",
-            "--playlist-name", "Flurb Playlist Test", "--yes"
+            "--playlist-name", "Flurb Playlist Test",
         ]).unwrap().command,
-        Command::Push { yes: true, .. }
+        Command::Push {
+            playlist_name: Some(_),
+            dry_run: false,
+            ..
+        }
     ));
+    assert!(Cli::try_parse_from([
+        "tool", "push", "tests/playlist-sync/playlist.m3u8",
+        "--from-plan", "plan.json"
+    ]).is_err());
 }
 
 #[test]
