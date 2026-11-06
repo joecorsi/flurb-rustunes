@@ -17,7 +17,6 @@ use std::{
 };
 use tokio::time::Instant;
 
-#[cfg(test)]
 use std::io::Read;
 
 use crate::engine::{
