@@ -28,12 +28,10 @@ use crate::engine::{
 
 pub(super) struct Options<'a> {
     pub(super) playlist: &'a Path,
-    pub(super) saved_plan: &'a Path,
     pub(super) name: &'a str,
     pub(super) state: &'a Path,
     pub(super) host_name: &'a str,
     pub(super) dry_run: bool,
-    pub(super) yes: bool,
     pub(super) seconds: u64,
 }
 
@@ -91,50 +89,56 @@ fn entries(text: &str) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-fn plan_rows(plan: &Value, playlist: &Path, paths: &[PathBuf]) -> Result<Vec<(u64, String)>> {
-    ensure!(plan["phone_deletions"] == 0, "saved plan is not additive");
-    ensure!(plan["execution_authorized_by_plan"] == false, "unexpected saved plan authorization");
-    ensure!(plan["journal_blockers"].as_array().is_some_and(Vec::is_empty),
-        "saved plan has journal blockers");
-    let source_root = plan["source_root"].as_str().context("saved plan has no source_root")?;
-    let root = fs::canonicalize(source_root).context("saved plan source directory has moved")?;
-    let parent = playlist.parent().context("playlist has no directory")?;
-    let sources = plan["sources"].as_array().context("saved plan has no source inventory")?;
-    ensure!(sources.len() == paths.len(), "saved plan must cover exactly these 10 playlist tracks");
-
-    let mut used_ids = BTreeSet::new();
-    let mut ids = Vec::new();
-    for entry in paths {
-        let selected = fs::canonicalize(parent.join(entry))
-            .with_context(|| format!("opening playlist entry {}", entry.display()))?;
-        ensure!(selected.starts_with(&root), "playlist entry lies outside saved source root");
-        let candidates: Vec<_> = sources.iter().filter(|source| {
-            let Some(name) = source["relative_path"].as_str() else {
-                return false;
-            };
-            fs::canonicalize(root.join(name)).is_ok_and(|p| p == selected)
-        }).collect();
-        ensure!(candidates.len() == 1, "playlist entry has no unique saved match: {}", entry.display());
-        let source = candidates[0];
-        ensure!(source["decision"] == "keep", "{} is not KEEP in saved plan", entry.display());
-        let expected_file = source["source_file_sha256"].as_str().context("saved source hash missing")?;
-        ensure!(sha_file(&selected)? == expected_file, "{} changed since dry-run", entry.display());
-        let matches = source["matches"].as_array().context("saved matching evidence absent")?;
-        ensure!(matches.len() == 1, "{} has ambiguous device matches", entry.display());
-        let matched = &matches[0];
-        ensure!(matched["ownership"] == "inserted_by_us"
-            && matched["encoded_audio_equal"] == true
-            && matched["match_basis"] == "owned_mpeg_frame_identity",
-            "{} is not an unchanged Rustunes-owned MP3", entry.display());
-        let id = u64::from_str_radix(
-            matched["track_id"].as_str().context("track ID absent")?, 16
-        )?;
-        ensure!(used_ids.insert(id), "two playlist entries refer to one device track");
-        let phone_sha = matched["device_file_sha256"].as_str()
-            .context("saved plan lacks actual phone file SHA-256")?;
-        ids.push((id, phone_sha.to_owned()));
+/// Match each M3U8 entry directly to exactly one existing, byte-identical
+/// MP3 on the freshly indexed phone. No stale plan or journal is involved.
+fn resolve_members(
+    playlist: &Path,
+    paths: &[PathBuf],
+    before: &Before,
+) -> Result<Vec<(u64, String)>> {
+    use crate::engine::state::audio_index::OtherCodec;
+    let root = fs::canonicalize(playlist.parent().unwrap_or(Path::new(".")))
+        .context("opening playlist folder")?;
+    let installed = before.snapshot.index.other_audio();
+    let mut used = BTreeSet::new();
+    let mut members = Vec::with_capacity(paths.len());
+    for relative in paths {
+        let path = fs::canonicalize(root.join(relative))
+            .with_context(|| format!("opening playlist track {}", relative.display()))?;
+        ensure!(
+            path.starts_with(&root),
+            "{} resolves outside the playlist folder",
+            relative.display()
+        );
+        let size = fs::metadata(&path)?.len();
+        let file_sha = sha_file(&path)?;
+        let matches: Vec<u64> = installed
+            .iter()
+            .filter(|(_, audio)| {
+                audio.file_bytes == size
+                    && hex(&audio.full_file_sha256) == file_sha
+                    && matches!(&audio.codec, OtherCodec::Mpeg1Layer3 { .. })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ensure!(
+            matches.len() == 1,
+            "{}: expected exactly one byte-identical MP3 already on the iPhone; found {}. Push the missing audio first, or resolve duplicates.",
+            relative.display(),
+            matches.len()
+        );
+        let id = matches[0];
+        ensure!(
+            before.current.catalog.tracks().iter().any(|track| track.sync_id == id),
+            "track {id:016x} has audio but no current catalogue registration"
+        );
+        ensure!(
+            used.insert(id),
+            "multiple M3U8 entries resolve to the same installed track {id:016x}"
+        );
+        members.push((id, file_sha));
     }
-    Ok(ids)
+    Ok(members)
 }
 
 fn qualify(before: &Before, name: &str, members: &[(u64, String)]) -> Result<()> {
@@ -218,15 +222,9 @@ fn verify(after: &Before, before: &Before, pid: u64, name: &str, members: &[(u64
 pub(super) async fn run(o: Options<'_>) -> Result<()> {
     ensure!(!o.name.trim().is_empty() && o.name.len() <= 255
         && !o.name.chars().any(char::is_control), "invalid playlist name");
-    ensure!(o.dry_run || o.yes,
-        "playlist creation writes to the iPhone; use --dry-run or explicitly pass --yes");
     ensure!(fs::metadata(o.playlist)?.len() <= 1024 * 1024, "M3U8 is too large");
-    ensure!(fs::metadata(o.saved_plan)?.len() <= 16 * 1024 * 1024, "saved plan is too large");
     let playlist_text = fs::read_to_string(o.playlist).context("reading playlist M3U8")?;
     let selected = entries(&playlist_text)?;
-    let plan: Value = serde_json::from_slice(&fs::read(o.saved_plan)?)
-        .context("reading saved dry-run plan")?;
-    let members = plan_rows(&plan, o.playlist, &selected)?;
 
     layout::private_directory(o.state)?;
     let tests = o.state.join("playlist-trials");
@@ -240,10 +238,7 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     let (identity, before) = removal_batch::capture_fresh(&root.join("before"), &control).await?;
-    ensure!(hex(&identity.device_digest()) == plan["device_sha256"].as_str().unwrap_or(""),
-        "the saved plan belongs to another device");
-    ensure!(hex(&identity.library_digest()) == plan["library_sha256"].as_str().unwrap_or(""),
-        "the saved plan belongs to another music library");
+    let members = resolve_members(o.playlist, &selected, &before)?;
     qualify(&before, o.name, &members)?;
 
     if o.dry_run {
@@ -266,7 +261,8 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
         "pid":format!("{pid:016x}"),
         "base_anchor":before.anchor(),
         "source":o.playlist,
-        "saved_plan":o.saved_plan,
+        "device_sha256":hex(&identity.device_digest()),
+        "library_sha256":hex(&identity.library_digest()),
         "members":members.iter().map(|(id, _)| format!("{id:016x}")).collect::<Vec<_>>(),
         "operation_sha256":hex(&Sha256::digest(&operation)),
         "before_audio_index_sha256":hex(&before.snapshot.index_receipt_sha256),
