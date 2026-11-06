@@ -9,7 +9,7 @@ use music_protocol::protocol::session::StartedOperation;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
@@ -23,7 +23,7 @@ use crate::engine::{
         native_insert::{Control, create_trace, durable_write},
         removal_batch::{self, Before, Requests, Sent},
     },
-    state::layout,
+    state::{journal::{Binding, Identity, Journal}, layout},
 };
 
 pub(super) struct Options<'a> {
@@ -123,12 +123,87 @@ fn same_mp3_codec(
     }
 }
 
-/// Match each M3U8 entry directly to exactly one existing, byte-identical
-/// MP3 on the freshly indexed phone. No stale plan or journal is involved.
+/// Active journal bindings are the authoritative source-to-track associations,
+/// not a temporary planning result or a guess based on title or filename.
+struct JournalMatches {
+    sources: BTreeMap<u64, PathBuf>,
+    bindings: Vec<Binding>,
+}
+
+fn journal_matches(state: &Path, before: &Before, identity: &Identity) -> Result<Option<JournalMatches>> {
+    let path = layout::journal_path(
+        state,
+        &before.snapshot.identity.device_identifier_sha256,
+        &before.snapshot.identity.library_identity_sha256,
+    )?;
+    if !path.join("journal.sqlite").try_exists()? {
+        return Ok(None);
+    }
+    let journal = Journal::open_read_only(&path, identity)
+        .with_context(|| format!("reading active Rustunes journal {}", path.display()))?;
+    journal.ensure_identity(identity)?;
+    let sources = journal.recorded_sources()?;
+    let bindings = journal.active_verified_bindings()?;
+    journal.recheck_read_only_source()?;
+    Ok(Some(JournalMatches { sources, bindings }))
+}
+
+/// Resolve a verified track ID from the journal. Prefer an explicitly recorded
+/// source path; if it is absent, a unique audio identity may resolve the same
+/// verified binding. Every candidate must still hold exactly the journaled
+/// file on this particular phone. Do not trust historical IDs without readback.
+fn journal_track(
+    path: &Path,
+    source: &music_protocol::media::fingerprint::TransferredSource,
+    journal: &JournalMatches,
+    before: &Before,
+) -> Result<Option<(u64, &'static str)>> {
+    let installed = &before.snapshot.index;
+    let in_catalog = |id| before.current.catalog.tracks().iter().any(|t| t.sync_id == id);
+    let bound: Vec<_> = journal.bindings.iter()
+        .filter(|b| {
+            b.content.source.audio.sha256 == source.audio.sha256
+                && !b.content.source.is_alac()
+                && installed.other_audio().contains_key(&b.content.track_pid)
+                && in_catalog(b.content.track_pid)
+                && installed.matches_transferred_source(
+                    b.content.track_pid, &b.content.path, &b.content.source
+                )
+        })
+        .collect();
+    let path_candidates: Vec<u64> = journal.sources.iter()
+        .filter(|(_, recorded)| recorded == &path)
+        .map(|(id, _)| *id)
+        .collect();
+    ensure!(
+        path_candidates.len() <= 1,
+        "multiple journal track IDs are recorded for {}", path.display()
+    );
+    if let Some(id) = path_candidates.first() {
+        ensure!(
+            bound.iter().any(|b| b.content.track_pid == *id),
+            "journal track {id:016x} for {} no longer holds its verified audio; refusing to use a stale track ID",
+            path.display()
+        );
+        return Ok(Some((*id, "journal-source")));
+    }
+    ensure!(
+        bound.len() <= 1,
+        "multiple active journal track IDs match the audio of {}; cannot choose a member",
+        path.display()
+    );
+    Ok(bound.first().map(|b| (b.content.track_pid, "journal-audio")))
+}
+
+/// Read each entry in M3U8 order. Prefer the exact active journal track ID;
+/// only if no verified journal association exists, consider a unique exact
+/// file match from the current device index. No stale plan is consulted.
+
 fn resolve_members(
     playlist: &Path,
     paths: &[PathBuf],
     before: &Before,
+    journal: Option<&JournalMatches>,
 ) -> Result<Vec<(u64, String)>> {
     let root = fs::canonicalize(playlist.parent().unwrap_or(Path::new(".")))
         .context("opening playlist folder")?;
@@ -155,24 +230,40 @@ fn resolve_members(
             "{} is not MPEG Layer III audio",
             relative.display()
         );
-        let size = source.fingerprint.file_bytes;
-        let file_sha = source.fingerprint.full_file_sha256.clone();
-        let matches: Vec<u64> = installed
-            .iter()
-            .filter(|(_, audio)| {
-                audio.file_bytes == size
-                    && hex(&audio.full_file_sha256) == file_sha
-                    && same_mp3_codec(&source, &audio.codec)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        ensure!(
-            matches.len() == 1,
-            "{}: expected exactly one byte-identical MP3 already on the iPhone; found {}. Push the missing audio first, or resolve duplicates.",
-            relative.display(),
-            matches.len()
+        let source_identity = source.transferred_identity()?;
+        let binding = journal
+            .map(|journal| journal_track(&path, &source_identity, journal, before))
+            .transpose()?
+            .flatten();
+        let (id, basis) = match binding {
+            Some(found) => found,
+            None => {
+                // No usable journal association: exact file+codec identity only.
+                let matches: Vec<u64> = installed
+                    .iter()
+                    .filter(|(_, audio)| {
+                        audio.file_bytes == source.fingerprint.file_bytes
+                            && hex(&audio.full_file_sha256)
+                                == source.fingerprint.full_file_sha256
+                            && same_mp3_codec(&source, &audio.codec)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                ensure!(
+                    matches.len() == 1,
+                    "{}: no verified journal track ID and {} exact on-device file matches. Push the missing audio first or resolve duplicates.",
+                    relative.display(), matches.len()
+                );
+                (matches[0], "exact-file-fallback")
+            }
+        };
+        let phone = installed.get(&id)
+            .with_context(|| format!("resolved track {id:016x} has no installed MP3 audio"))?;
+        let file_sha = hex(&phone.full_file_sha256);
+        println!(
+            "MATCH \"{}\" -> track {id:016x} ({basis})",
+            relative.display()
         );
-        let id = matches[0];
         ensure!(
             before.current.catalog.tracks().iter().any(|track| track.sync_id == id),
             "track {id:016x} has audio but no current catalogue registration"
@@ -316,7 +407,8 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     let (identity, before) = removal_batch::capture_fresh(&root.join("before"), &control).await?;
-    let members = resolve_members(o.playlist, &selected, &before)?;
+    let journal = journal_matches(o.state, &before, &identity)?;
+    let members = resolve_members(o.playlist, &selected, &before, journal.as_ref())?;
     qualify(&before, o.name, &members)?;
 
     if !o.dry_run {
