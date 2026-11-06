@@ -284,15 +284,9 @@ enum Command {
         /// Exclude an exact root-relative file or subtree; exclusions win.
         #[arg(long, value_name = "PATH")]
         exclude: Vec<String>,
-        /// Verified prior push plan for an .m3u8 test playlist.
-        #[arg(long, value_name = "PLAN")]
-        from_plan: Option<PathBuf>,
-        /// Name of the .m3u8 playlist created on the phone.
+        /// Optional destination playlist name (default: M3U8 file stem).
         #[arg(long, value_name = "NAME")]
         playlist_name: Option<String>,
-        /// Explicitly authorize the test playlist write.
-        #[arg(long)]
-        yes: bool,
     },
     /// Rebuild this host's journal from the phone's current library: carry forward what an earlier journal (even one that another version of rustunes wrote) knows, and bind each phone track a library file holds. Nothing is sent to the phone.
     Pull {
@@ -849,10 +843,8 @@ fn sources_to_warm(command: &Command) -> Option<(PathBuf, source_collection::Sel
                 ..Default::default()
             },
         )),
-        Command::Push {
-            from_plan: Some(_),
-            ..
-        } => None,
+        Command::Push { path: Some(path), .. }
+            if path.extension().and_then(|ext| ext.to_str()) == Some("m3u8") => None,
         Command::Push {
             path,
             recursive,
@@ -1227,11 +1219,8 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
             recursive,
             include,
             exclude,
-            from_plan,
             playlist_name,
-            yes,
         } => {
-            let library = config::load()?.library;
             let path = match path {
                 Some(path) => path,
                 None => config::library()?,
@@ -1241,26 +1230,28 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                 anyhow::ensure!(
                     snapshot.is_none() && journal.is_none() && !recursive
                         && include.is_empty() && exclude.is_empty() && !flac_to_alac,
-                    "playlist push accepts --from-plan, --playlist-name, --dry-run and --yes; track selection flags are not supported"
+                    "playlist push accepts --playlist-name and --dry-run; track selection flags are not supported"
                 );
-                let plan = from_plan.as_deref().context("playlist push requires --from-plan PATH from a successful track push dry-run")?;
-                let name = playlist_name.as_deref().context("playlist push requires --playlist-name NAME")?;
+                let name = match playlist_name.as_deref() {
+                    Some(name) => name,
+                    None => path.file_stem().and_then(|name| name.to_str())
+                        .context("playlist file has no usable name; pass --playlist-name")?,
+                };
                 playlist_push::run(playlist_push::Options {
                     playlist: &path,
-                    saved_plan: plan,
                     name,
                     state: &state,
                     host_name: &host_name,
                     dry_run,
-                    yes,
                     seconds,
                 }).await?;
                 return Ok(ExitCode::SUCCESS);
             }
             anyhow::ensure!(
-                from_plan.is_none() && playlist_name.is_none() && !yes,
-                "--from-plan, --playlist-name and --yes only apply to an .m3u8 playlist"
+                playlist_name.is_none(),
+                "--playlist-name only applies to an .m3u8 playlist"
             );
+            let library = config::load()?.library;
             let selection = source_collection::SelectionOptions {
                 recursive,
                 include: include.into_iter().collect(),
