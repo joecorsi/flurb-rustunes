@@ -24,7 +24,6 @@ use crate::engine::{
         removal_batch::{self, Before, Requests, Sent},
     },
     state::layout,
-    verification::sql_tables::reader::Cell,
 };
 
 pub(super) struct Options<'a> {
