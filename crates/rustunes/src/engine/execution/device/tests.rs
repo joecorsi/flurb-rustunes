@@ -215,10 +215,17 @@ fn leave_socket_file(path: &Path) {
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     };
-    let socket = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let socket = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     assert!(socket >= 0, "{}", std::io::Error::last_os_error());
     // Closes the descriptor when dropped; the socket file stays.
     let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+    // SOCK_CLOEXEC is Linux-specific; set close-on-exec portably for macOS tests.
+    assert_eq!(
+        unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let name = path.as_os_str().as_bytes();
