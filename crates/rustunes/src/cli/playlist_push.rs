@@ -85,7 +85,8 @@ fn entries(text: &str) -> Result<Vec<PathBuf>> {
         ensure!(seen.insert(path.clone()), "duplicate playlist entry: {line}");
         found.push(path);
     }
-    ensure!(found.len() == 10, "the first playlist trial requires exactly 10 unique tracks");
+    ensure!(!found.is_empty() && found.len() <= 499,
+        "a playlist must contain 1..=499 distinct MP3 tracks");
     Ok(found)
 }
 
@@ -145,14 +146,16 @@ fn qualify(before: &Before, name: &str, members: &[(u64, String)]) -> Result<()>
     let containers = before.sql.table("container")?;
     for (row, multiplicity) in &containers.rows {
         ensure!(*multiplicity == 1, "duplicate existing container row");
-        let existing = containers.at(row, "name")?.text()?;
-        ensure!(!existing.eq_ignore_ascii_case(name), "playlist already exists: {name}; refusing duplicate");
+        if let Ok(existing) = containers.at(row, "name")?.text() {
+            ensure!(!existing.eq_ignore_ascii_case(name),
+                "playlist already exists: {name}; refusing duplicate");
+        }
     }
     let index = &before.snapshot.index;
     for (id, sha) in members {
         let found = index.other_audio().get(id)
             .with_context(|| format!("track {id:016x} is no longer installed as MP3"))?;
-        ensure!(hex(&found.full_file_sha256) == *sha, "phone track {id:016x} changed since dry-run");
+        ensure!(hex(&found.full_file_sha256) == *sha, "phone track {id:016x} changed during matching");
         ensure!(before.current.catalog.tracks().iter().any(|t| t.sync_id == *id),
             "track {id:016x} is absent from current catalogue");
     }
