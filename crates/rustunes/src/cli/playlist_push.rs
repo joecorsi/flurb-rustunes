@@ -146,7 +146,7 @@ fn resolve_members(
         let source = music_protocol::media::mpeg::read(&path)
             .with_context(|| format!("inspecting playlist MP3 {}", relative.display()))?;
         let size = source.fingerprint.file_bytes;
-        let file_sha = source.fingerprint.full_file_sha256;
+        let file_sha = source.fingerprint.full_file_sha256.clone();
         let matches: Vec<u64> = installed
             .iter()
             .filter(|(_, audio)| {
