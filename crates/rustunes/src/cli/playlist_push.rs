@@ -90,6 +90,39 @@ fn entries(text: &str) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// The index represents MPEG-1 Layer III as a frame layout, but MPEG-2
+/// and MPEG-2.5 Layer III as an EncodedAudio record. A byte-identical
+/// file must also have the same independently decoded codec/layout.
+fn same_mp3_codec(
+    source: &music_protocol::media::mpeg::Source,
+    codec: &crate::engine::state::audio_index::OtherCodec,
+) -> bool {
+    use crate::engine::state::audio_index::OtherCodec;
+    match codec {
+        OtherCodec::Encoded(encoded) => source
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.encoded == *encoded),
+        OtherCodec::Mpeg1Layer3 {
+            sample_rate,
+            channels,
+            frame_count,
+            audio_offset,
+            audio_bytes,
+            trailing_tag_bytes,
+        } => {
+            let audio = &source.fingerprint.audio;
+            source.stream.is_none()
+                && *sample_rate == audio.sample_rate
+                && *channels == audio.channels
+                && *frame_count == audio.frame_count
+                && *audio_offset == source.audio_offset
+                && *audio_bytes == audio.audio_bytes
+                && *trailing_tag_bytes == source.trailing_tag_bytes
+        }
+    }
+}
+
 /// Match each M3U8 entry directly to exactly one existing, byte-identical
 /// MP3 on the freshly indexed phone. No stale plan or journal is involved.
 fn resolve_members(
@@ -97,7 +130,6 @@ fn resolve_members(
     paths: &[PathBuf],
     before: &Before,
 ) -> Result<Vec<(u64, String)>> {
-    use crate::engine::state::audio_index::OtherCodec;
     let root = fs::canonicalize(playlist.parent().unwrap_or(Path::new(".")))
         .context("opening playlist folder")?;
     let installed = before.snapshot.index.other_audio();
@@ -111,14 +143,16 @@ fn resolve_members(
             "{} resolves outside the playlist folder",
             relative.display()
         );
-        let size = fs::metadata(&path)?.len();
-        let file_sha = sha_file(&path)?;
+        let source = music_protocol::media::mpeg::read(&path)
+            .with_context(|| format!("inspecting playlist MP3 {}", relative.display()))?;
+        let size = source.fingerprint.file_bytes;
+        let file_sha = source.fingerprint.full_file_sha256;
         let matches: Vec<u64> = installed
             .iter()
             .filter(|(_, audio)| {
                 audio.file_bytes == size
                     && hex(&audio.full_file_sha256) == file_sha
-                    && matches!(&audio.codec, OtherCodec::Mpeg1Layer3 { .. })
+                    && same_mp3_codec(&source, &audio.codec)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -367,6 +401,17 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fixture_mp3_classification_matches_current_phone_index_shape() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/playlist-sync/generated/Flurb-Test-01.mp3");
+        let source = music_protocol::media::mpeg::read(&path).unwrap();
+        let (bytes, hash, codec) = music_protocol::media::other_audio::read(&path).unwrap();
+        assert_eq!(bytes, source.fingerprint.file_bytes);
+        assert_eq!(hex(&hash), source.fingerprint.full_file_sha256);
+        assert!(same_mp3_codec(&source, &codec), "MP3 codecs differ for exact same fixture");
+    }
+
     #[test]
     fn committed_playlist_has_ten_existing_mp3_files() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
