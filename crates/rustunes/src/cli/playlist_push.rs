@@ -145,6 +145,16 @@ fn resolve_members(
         );
         let source = music_protocol::media::mpeg::read(&path)
             .with_context(|| format!("inspecting playlist MP3 {}", relative.display()))?;
+        ensure!(
+            matches!(
+                source.format(),
+                music_protocol::media::format::Format::Mpeg1Layer3
+                    | music_protocol::media::format::Format::Mpeg2Layer3
+                    | music_protocol::media::format::Format::Mpeg25Layer3
+            ),
+            "{} is not MPEG Layer III audio",
+            relative.display()
+        );
         let size = source.fingerprint.file_bytes;
         let file_sha = source.fingerprint.full_file_sha256.clone();
         let matches: Vec<u64> = installed
