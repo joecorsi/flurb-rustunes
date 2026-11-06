@@ -6,9 +6,12 @@ seconds long, with artist `Flurb Test Artist` and album
 
 ## Create a playlist from audio already on the phone
 
-The experimental `push playlist.m3u8` creates an iPhone playlist by matching
-the source files directly against a **fresh, read-only, complete device audio
-index**. It does **not** need a retained plan or journal path.
+The experimental `push playlist.m3u8` creates an iPhone playlist by
+resolving each local file through Rustunes' **active verified journal binding**
+to an existing on-device track ID, then checking that ID against a fresh,
+complete device audio index. It does **not** need a retained plan or a manually
+supplied journal path. When a track has no verified journal binding, only a
+unique exact-file match qualifies.
 
 From the repository root, with the iPhone connected, first inspect:
 
@@ -16,8 +19,9 @@ From the repository root, with the iPhone connected, first inspect:
 cargo run -- push tests/playlist-sync/playlist.m3u8 --playlist-name "Flurb Playlist Test" --dry-run
 ```
 
-A successful dry run reports 10 exact, unique installed MP3 matches and
-**no phone writes**. Then create the playlist:
+A successful dry run reports 10 resolved existing track IDs (including
+whether each came from `journal-source`, `journal-audio`, or
+`exact-file-fallback`), and **no phone writes**. Then create the playlist:
 
 ```sh
 cargo run -- push tests/playlist-sync/playlist.m3u8 --playlist-name "Flurb Playlist Test"
@@ -40,8 +44,10 @@ artwork again.
 
 - Currently accepts 1–499 distinct MP3 paths, relative to the M3U8 file.
   Other codecs and playlists of 500+ tracks will be supported separately.
-- Only a **unique byte-for-byte match** to an already installed MP3 qualifies.
-  If tags differ, or multiple device copies match the same file, it refuses.
+- Active journal bindings allow source tag changes when the encoded audio
+  identity remains the same and the recorded phone file is still verified.
+  Without such a binding, only a **unique byte-for-byte match** qualifies.
+  Missing or ambiguous identities refuse the operation.
 - Creates an ordinary playlist in M3U8 order. It refuses an existing playlist
   with the same name rather than updating or duplicating it.
 - A signed session saves persistent Started evidence before writing. After a
