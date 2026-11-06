@@ -23,7 +23,7 @@ use crate::engine::{
         native_insert::{Control, create_trace, durable_write},
         removal_batch::{self, Before, Requests, Sent},
     },
-    state::{layout, audio_index::DeviceAudioIndex},
+    state::layout,
     verification::sql_tables::reader::Cell,
 };
 
