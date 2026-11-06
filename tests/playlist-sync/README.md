@@ -1,76 +1,54 @@
 # Flurb iPhone playlist test
 
-This directory includes **10 committed, playable MP3 files**, each approximately
-five seconds long (5.04 seconds due to MPEG frame boundaries). They contain
-different kinds of synthesized noise: white, pink, brown, blue, violet, velvet,
-low rumble, bright hiss, radio static and wind gust.
+This directory holds **10 committed, playable MP3 files**, each around five
+seconds long, with artist `Flurb Test Artist` and album
+`Flurb Playlist Test`. Their desired order is in `playlist.m3u8`.
 
-All ten are **ID3v2.3** files. They have distinct titles, sequential
-1/10–10/10 track numbers, artist `Flurb Test Artist` and album
-`Flurb Playlist Test`. Each was decoded, checked for a ~5-second duration
-and verified as ID3v2.3 before committing.
+## Create a playlist from audio already on the phone
 
-**No Homebrew, FFmpeg, or generator command is required on your Mac.**
-The audio files are already in `generated/` and tracked by git.
+The experimental `push playlist.m3u8` creates an iPhone playlist by matching
+the source files directly against a **fresh, read-only, complete device audio
+index**. It does **not** need a retained plan or journal path.
 
-From the repository root, with the iPhone connected:
+From the repository root, with the iPhone connected, first inspect:
 
 ```sh
-git pull
-cargo run -- library stats
-cargo run -- push tests/playlist-sync/generated --dry-run
+cargo run -- push tests/playlist-sync/playlist.m3u8 --playlist-name "Flurb Playlist Test" --dry-run
 ```
 
-Only after confirming that the phone has the expected empty baseline and the
-dry run proposes exactly 10 additions:
+A successful dry run reports 10 exact, unique installed MP3 matches and
+**no phone writes**. Then create the playlist:
 
 ```sh
-cargo run -- push tests/playlist-sync/generated
-cargo run -- library stats
-```
-
-`playlist.m3u8` is the intended ten-song ordering **for later playlist
-creation**; it is not automatically synchronized by `push`.
-
-Rustunes now has a pure `insert_playlist` operation encoder, but the journaled
-playlist-create CLI, signed transport and after-state membership verification
-are still to be implemented. Do not treat a successful track push as evidence
-that the playlist was created.
-
-
-## Experimental playlist creation (feature branch only)
-
-Once the `push generated --dry-run` result confirms exactly ten matched
-Rustunes-owned MP3 tracks (zero additions, zero conflicts), use its retained
-`plan.json` to bind the M3U8 entries to existing device track IDs.
-
-First check the code builds and the new tests pass:
-
-```sh
-cargo test -p rustunes playlist_push
-cargo test -p rustunes playlist_push_requires_an_m3u8
-```
-
-Point `PLAN` to the exact `plan.json` reported by the most recent successful
-track push dry-run:
-
-```sh
-PLAN="/absolute/path/to/plan.json"
-cargo run -- push tests/playlist-sync/playlist.m3u8 --from-plan "$PLAN" --playlist-name "Flurb Playlist Test" --dry-run
-```
-
-**Only after verifying that the dry run reports ten matched tracks**, run:
-
-```sh
-cargo run -- push tests/playlist-sync/playlist.m3u8 --from-plan "$PLAN" --playlist-name "Flurb Playlist Test" --yes
+cargo run -- push tests/playlist-sync/playlist.m3u8 --playlist-name "Flurb Playlist Test"
 cargo run -- list
 ```
 
-This is an isolated trial of one confirmed `insert_playlist` shape, not a
-production playlist sync. It reuses the existing signed metadata-only transport,
-writes durable input/Started evidence under the local state `playlist-trials`
-directory, refuses duplicate names and ambiguous IDs, and checks the full
-ordered membership and unchanged audio after sending. **Do not blindly rerun
-a started trial after any transport or verification error**; inspect the phone
-with `list` and retain its evidence. The normal `resume` CLI does not yet
-handle these experimental playlist trial records.
+The name defaults to the M3U8 filename stem; `--playlist-name` overrides it.
+
+If an MP3 is missing on the phone, **first push its audio**:
+
+```sh
+cargo run -- push tests/playlist-sync/generated
+```
+
+That step sends tracks but does not create the playlist. The second step
+references the tracks already on the phone; it does not transfer audio or
+artwork again.
+
+## Limitations of this first implementation
+
+- Currently accepts exactly ten distinct MP3 paths, relative to the M3U8
+  file. Other counts and codecs will be supported separately.
+- Only a **unique byte-for-byte match** to an already installed MP3 qualifies.
+  If tags differ, or multiple device copies match the same file, it refuses.
+- Creates an ordinary playlist in M3U8 order. It refuses an existing playlist
+  with the same name rather than updating or duplicating it.
+- A signed session saves persistent Started evidence before writing. After a
+  lost connection, **do not blindly rerun**; an unresolved Started trial blocks
+  another trial on the same phone/library until investigated. The general
+  `resume` command does not yet support these trial records.
+- A successful run verifies the new playlist's identity, name and ordered
+  membership and confirms the phone audio inventory was preserved.
+
+No external audio generator or FFmpeg step is needed for these MP3 fixtures.
