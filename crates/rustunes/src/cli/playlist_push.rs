@@ -159,6 +159,37 @@ fn qualify(before: &Before, name: &str, members: &[(u64, String)]) -> Result<()>
     Ok(())
 }
 
+/// A previous Started trial might have created its playlist even if the
+/// verification connection failed. Never queue a second creation on that
+/// device/library until the first result has been investigated.
+fn refuse_unsettled_trial(
+    trials: &Path,
+    device_sha: &str,
+    library_sha: &str,
+) -> Result<()> {
+    for entry in fs::read_dir(trials)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if !path.join("started.json").exists() || path.join("verified.json").exists() {
+            continue;
+        }
+        let contents = fs::read(path.join("input.json"))
+            .with_context(|| format!("reading unfinished trial {}", path.display()))?;
+        let prior: Value = serde_json::from_slice(&contents)
+            .with_context(|| format!("reading unfinished trial {}", path.display()))?;
+        if prior["device_sha256"] == device_sha && prior["library_sha256"] == library_sha {
+            bail!(
+                "a previous playlist creation has not been verified: {}. Inspect the phone before any new playlist creation; never retry an uncertain write",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn fresh_pid(before: &Before) -> Result<u64> {
     let mut random = File::open("/dev/urandom")?;
     for _ in 0..64 {
@@ -241,6 +272,13 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
     let members = resolve_members(o.playlist, &selected, &before)?;
     qualify(&before, o.name, &members)?;
 
+    if !o.dry_run {
+        refuse_unsettled_trial(
+            &tests,
+            &hex(&identity.device_digest()),
+            &hex(&identity.library_digest()),
+        )?;
+    }
     if o.dry_run {
         println!("Playlist dry-run: {:?} → {} existing tracks, correct M3U8 order; 0 audio transfers", o.name, members.len());
         println!("No phone writes. Evidence: {}", root.display());
