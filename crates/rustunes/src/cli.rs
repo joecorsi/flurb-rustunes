@@ -284,6 +284,15 @@ enum Command {
         /// Exclude an exact root-relative file or subtree; exclusions win.
         #[arg(long, value_name = "PATH")]
         exclude: Vec<String>,
+        /// Verified prior push plan for an .m3u8 test playlist.
+        #[arg(long, value_name = "PLAN")]
+        from_plan: Option<PathBuf>,
+        /// Name of the .m3u8 playlist created on the phone.
+        #[arg(long, value_name = "NAME")]
+        playlist_name: Option<String>,
+        /// Explicitly authorize the test playlist write.
+        #[arg(long)]
+        yes: bool,
     },
     /// Rebuild this host's journal from the phone's current library: carry forward what an earlier journal (even one that another version of rustunes wrote) knows, and bind each phone track a library file holds. Nothing is sent to the phone.
     Pull {
@@ -432,15 +441,6 @@ enum Command {
         /// Exclude an exact root-relative file or subtree; exclusions win.
         #[arg(long, value_name = "PATH")]
         exclude: Vec<String>,
-        /// Verified prior push plan for an .m3u8 test playlist.
-        #[arg(long, value_name = "PLAN")]
-        from_plan: Option<PathBuf>,
-        /// Name of the .m3u8 playlist created on the phone.
-        #[arg(long, value_name = "NAME")]
-        playlist_name: Option<String>,
-        /// Explicitly authorize the test playlist write.
-        #[arg(long)]
-        yes: bool,
     },
     /// Save a complete read-only device catalogue and audio index for planning.
     Snapshot {
