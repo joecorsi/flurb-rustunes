@@ -38,8 +38,8 @@ artwork again.
 
 ## Limitations of this first implementation
 
-- Currently accepts exactly ten distinct MP3 paths, relative to the M3U8
-  file. Other counts and codecs will be supported separately.
+- Currently accepts 1–499 distinct MP3 paths, relative to the M3U8 file.
+  Other codecs and playlists of 500+ tracks will be supported separately.
 - Only a **unique byte-for-byte match** to an already installed MP3 qualifies.
   If tags differ, or multiple device copies match the same file, it refuses.
 - Creates an ordinary playlist in M3U8 order. It refuses an existing playlist
