@@ -11,12 +11,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::Read,
     path::{Component, Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::Instant;
+
+#[cfg(test)]
+use std::io::Read;
 
 use crate::engine::{
     execution::{
@@ -52,6 +54,7 @@ fn hex(bytes: &[u8]) -> String {
     music_protocol::protocol::transfer::hex(bytes)
 }
 
+#[cfg(test)]
 fn sha_file(path: &Path) -> Result<String> {
     ensure!(fs::metadata(path)?.len() <= 64 * 1024 * 1024, "source exceeds 64 MiB fixture limit");
     let mut reader = File::open(path)?;
