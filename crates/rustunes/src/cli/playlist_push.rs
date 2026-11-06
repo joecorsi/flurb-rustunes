@@ -368,6 +368,32 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn committed_playlist_has_ten_existing_mp3_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/playlist-sync");
+        let playlist = root.join("playlist.m3u8");
+        let list = entries(&fs::read_to_string(&playlist).unwrap()).unwrap();
+        assert_eq!(list.len(), 10);
+        let mut digests = BTreeSet::new();
+        for entry in &list {
+            let path = root.join(entry);
+            assert!(path.is_file(), "missing fixture {}", path.display());
+            assert!(digests.insert(sha_file(&path).unwrap()), "fixture files duplicate");
+        }
+    }
+
+    #[test]
+    fn allows_nonempty_playlist_of_up_to_499_entries() {
+        assert!(entries("one.mp3\n").is_ok());
+        assert!(entries("").is_err());
+        let many = (1..=500)
+            .map(|n| format!("track-{n}.mp3\n"))
+            .collect::<String>();
+        assert!(entries(&many).is_err());
+        assert!(entries(&many.lines().take(499).collect::<Vec<_>>().join("\n")).is_ok());
+    }
+
+    #[test]
     fn reads_only_safe_relative_mp3_entries() {
         let text = "#EXTM3U\n".to_string() +
             &(1..=10).map(|n| format!("#EXTINF:5,Track {n}\ngenerated/Flurb-Test-{n:02}.mp3\n"))
