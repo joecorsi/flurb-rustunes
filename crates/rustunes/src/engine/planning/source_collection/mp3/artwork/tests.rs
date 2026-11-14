@@ -42,7 +42,7 @@ impl Temp {
                 "-video_size",
                 &format!("{width}x{height}"),
                 "-i",
-                "/proc/self/fd/0",
+                music_protocol::media::ffmpeg::SEEKABLE_STDIN,
                 "-frames:v",
                 "1",
                 "-threads",

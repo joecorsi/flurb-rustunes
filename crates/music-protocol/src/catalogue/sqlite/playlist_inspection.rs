@@ -3,8 +3,8 @@
 //! inferences are used by synchronization or transfer logic.
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
-use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_PLAYLIST_ROWS: usize = 10_000;
 const MAX_LIKE_STATES: usize = 64;
@@ -69,7 +69,9 @@ pub(super) fn inspect(connection: &Connection) -> (Value, Value, Vec<Value>) {
                 Ok(rows) => {
                     for result in rows {
                         match result {
-                            Ok(playlist) if playlists.len() < MAX_PLAYLIST_ROWS => playlists.push(playlist),
+                            Ok(playlist) if playlists.len() < MAX_PLAYLIST_ROWS => {
+                                playlists.push(playlist)
+                            }
                             Ok(_) => {
                                 warnings.push(json!({
                                     "code": "playlist_row_limit",
@@ -113,32 +115,40 @@ pub(super) fn inspect(connection: &Connection) -> (Value, Value, Vec<Value>) {
         LIMIT 65
     "#;
     match connection.prepare(LIKES) {
-        Ok(mut statement) => match statement.query_map([], |row| {
-            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
-        }) {
-            Ok(rows) => {
-                for result in rows {
-                    match result {
-                        Ok((state, count)) if liked_states.len() < MAX_LIKE_STATES => {
-                            liked_states.push(json!({"state": state, "tracks": count}));
-                        }
-                        Ok(_) => {
-                            warnings.push(json!({"code":"liked_state_row_limit","limit":MAX_LIKE_STATES}));
-                            break;
-                        }
-                        Err(error) => {
-                            warnings.push(json!({"code":"liked_state_row_error","message":error.to_string()}));
-                            break;
+        Ok(mut statement) => {
+            match statement.query_map([], |row| {
+                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                Ok(rows) => {
+                    for result in rows {
+                        match result {
+                            Ok((state, count)) if liked_states.len() < MAX_LIKE_STATES => {
+                                liked_states.push(json!({"state": state, "tracks": count}));
+                            }
+                            Ok(_) => {
+                                warnings.push(
+                                    json!({"code":"liked_state_row_limit","limit":MAX_LIKE_STATES}),
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                warnings.push(json!({"code":"liked_state_row_error","message":error.to_string()}));
+                                break;
+                            }
                         }
                     }
                 }
+                Err(error) => warnings
+                    .push(json!({"code":"liked_state_query_error","message":error.to_string()})),
             }
-            Err(error) => warnings.push(json!({"code":"liked_state_query_error","message":error.to_string()})),
-        },
-        Err(error) => warnings.push(json!({"code":"liked_state_query_error","message":error.to_string()})),
+        }
+        Err(error) => {
+            warnings.push(json!({"code":"liked_state_query_error","message":error.to_string()}))
+        }
     }
 
-    let favored = liked_states.iter()
+    let favored = liked_states
+        .iter()
         .find(|entry| entry["state"] == 2)
         .and_then(|entry| entry["tracks"].as_i64())
         .unwrap_or(0);
@@ -149,7 +159,6 @@ pub(super) fn inspect(connection: &Connection) -> (Value, Value, Vec<Value>) {
     });
     (Value::Array(playlists), favorites, warnings)
 }
-
 
 const COMPARE_TRACK_LIMIT: usize = 50_000;
 const COMPARE_MEMBER_LIMIT: usize = 50_000;
@@ -193,11 +202,14 @@ fn compare_favorites_inner(connection: &Connection, name: &str) -> Result<Value>
          LEFT JOIN item_extra e ON e.item_pid=i.item_pid
          LEFT JOIN item_artist ia ON ia.item_artist_pid=i.item_artist_pid
          LEFT JOIN item_stats st ON st.item_pid=i.item_pid
-         WHERE i.media_type=8 AND s.sync_id<>0"
+         WHERE i.media_type=8 AND s.sync_id<>0",
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        ensure!(tracks.len() < COMPARE_TRACK_LIMIT, "track comparison row limit exceeded");
+        ensure!(
+            tracks.len() < COMPARE_TRACK_LIMIT,
+            "track comparison row limit exceeded"
+        );
         let item_pid: i64 = row.get(0)?;
         let sync_id: i64 = row.get(1)?;
         let title: Option<String> = row.get(2)?;
@@ -210,7 +222,10 @@ fn compare_favorites_inner(connection: &Connection, name: &str) -> Result<Value>
             "artist": artist,
             "liked_state": liked_state,
         });
-        ensure!(tracks.insert(item_pid, info).is_none(), "duplicate track identity");
+        ensure!(
+            tracks.insert(item_pid, info).is_none(),
+            "duplicate track identity"
+        );
         if liked_state == Some(2) {
             favorite_ids.insert(item_pid);
         }
@@ -220,9 +235,8 @@ fn compare_favorites_inner(connection: &Connection, name: &str) -> Result<Value>
 
     let mut members = BTreeSet::<i64>::new();
     let mut membership_rows = 0usize;
-    let mut statement = connection.prepare(
-        "SELECT item_pid FROM container_item WHERE container_pid=?1"
-    )?;
+    let mut statement =
+        connection.prepare("SELECT item_pid FROM container_item WHERE container_pid=?1")?;
     let mut rows = statement.query([container_pid])?;
     while let Some(row) = rows.next()? {
         ensure!(
@@ -295,14 +309,20 @@ mod tests {
         let (playlists, favorites, warnings) = inspect(&fixture.connection);
         assert!(playlists.as_array().unwrap().is_empty());
         assert_eq!(favorites["candidate_favorite_tracks_liked_state_2"], 0);
-        assert!(warnings.iter().any(|entry| entry["code"] == "playlist_query_error"));
+        assert!(
+            warnings
+                .iter()
+                .any(|entry| entry["code"] == "playlist_query_error")
+        );
     }
 
     #[test]
     fn compare_favorite_membership_in_both_directions() {
         let fixture = Fixture::new(false);
-        fixture.connection.execute_batch(
-            "ALTER TABLE container ADD COLUMN name TEXT;
+        fixture
+            .connection
+            .execute_batch(
+                "ALTER TABLE container ADD COLUMN name TEXT;
              UPDATE container SET name='flurbz' WHERE container_pid=81;
              CREATE TABLE container_item(
                  container_item_pid INTEGER PRIMARY KEY,
@@ -317,8 +337,9 @@ mod tests {
              INSERT INTO item_extra SELECT 2,title,'SECOND.m4a',total_time_ms,file_size,
                  track_count,disc_count,year,copyright,content_rating,
                  content_rating_level,sort_title,comment FROM item_extra WHERE item_pid=1;
-             INSERT INTO item_stats VALUES(2,0,0,0,0,0,0,0,2);"
-        ).unwrap();
+             INSERT INTO item_stats VALUES(2,0,0,0,0,0,0,0,2);",
+            )
+            .unwrap();
         let result = compare_favorites(&fixture.connection, "flurbz");
         assert!(result.get("error").is_none(), "{result:?}");
         assert_eq!(result["playlist_synced_music_tracks"], 1);
@@ -327,27 +348,49 @@ mod tests {
         assert_eq!(result["favorite_not_in_playlist"][0]["item_pid"], "2");
         assert_eq!(result["playlist_not_favorited"][0]["item_pid"], "1");
 
-        fixture.connection.execute_batch(
-            "UPDATE item_stats SET liked_state=2 WHERE item_pid=1;"
-        ).unwrap();
+        fixture
+            .connection
+            .execute_batch("UPDATE item_stats SET liked_state=2 WHERE item_pid=1;")
+            .unwrap();
         let updated = compare_favorites(&fixture.connection, "flurbz");
         assert_eq!(updated["overlap"], 1);
-        assert_eq!(updated["favorite_not_in_playlist"].as_array().unwrap().len(), 1);
-        assert_eq!(updated["playlist_not_favorited"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            updated["favorite_not_in_playlist"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            updated["playlist_not_favorited"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[test]
     fn comparison_reports_missing_or_ambiguous_playlist_names() {
         let fixture = Fixture::new(false);
         let missing = compare_favorites(&fixture.connection, "flurbz");
-        assert!(missing["error"].as_str().unwrap().contains("no such column"));
-        fixture.connection.execute_batch(
-            "ALTER TABLE container ADD COLUMN name TEXT;
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap()
+                .contains("no such column")
+        );
+        fixture
+            .connection
+            .execute_batch(
+                "ALTER TABLE container ADD COLUMN name TEXT;
              UPDATE container SET name='flurbz' WHERE container_pid=81;
-             INSERT INTO container VALUES(82,-82,'flurbz');"
-        ).unwrap();
+             INSERT INTO container VALUES(82,-82,'flurbz');",
+            )
+            .unwrap();
         let ambiguous = compare_favorites(&fixture.connection, "flurbz");
-        assert!(ambiguous["error"].as_str().unwrap().contains("multiple playlists"));
+        assert!(
+            ambiguous["error"]
+                .as_str()
+                .unwrap()
+                .contains("multiple playlists")
+        );
     }
-
 }

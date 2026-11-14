@@ -599,7 +599,7 @@ fn inspect_other(source: &SelectedSource) -> Result<music_protocol::media::mpeg:
         )?,
         "selected source changed since discovery"
     );
-    let inspected = music_protocol::media::mpeg::read(&source.absolute_path)?;
+    let inspected = crate::engine::planning::source_reads::mpeg(&source.absolute_path)?;
     ensure!(
         same_metadata(
             &source.discovered,

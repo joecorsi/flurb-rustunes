@@ -42,8 +42,11 @@ pub fn private_file(path: &Path) -> Result<fs::File> {
                 libc::openat(
                     directory_fd,
                     name.as_ptr(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
-                        | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
                     0o600 as libc::c_uint,
                 )
             };

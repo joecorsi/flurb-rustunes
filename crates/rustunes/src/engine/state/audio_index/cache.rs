@@ -697,6 +697,57 @@ pub(super) fn counts_for_tests(config: &Config) -> (u64, u64) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn frontend_engine_cache_survives_nested_phases_and_restores_outer_scope() {
+        use crate::engine::{DeviceConfig, Engine};
+        let config = || crate::engine::Config {
+            device: DeviceConfig::default(),
+            deadline: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let cache = Config::new("/unused/frontend-cache".into(), Mode::Reuse);
+        let shared = cache.shared.clone();
+        let outer = Engine::quiet(config()).with_fingerprint_cache(cache);
+        let phase = outer.clone();
+        let independent = Engine::quiet(config())
+            .with_fingerprint_cache(Config::new("/unused/other-cache".into(), Mode::Refresh));
+        assert!(current().is_none());
+        outer
+            .scope(async {
+                assert!(Arc::ptr_eq(&current().unwrap().shared, &shared));
+                phase
+                    .scope(async {
+                        let active = current().unwrap();
+                        assert!(active.reuses());
+                        assert!(Arc::ptr_eq(&active.shared, &shared));
+                        crate::engine::execution::device::remember_snapshot(Path::new(
+                            "/unused/verified-snapshot",
+                        ));
+                    })
+                    .await;
+                phase
+                    .scope(async {
+                        assert_eq!(
+                            crate::engine::execution::device::remembered_snapshot(),
+                            Some("/unused/verified-snapshot".into())
+                        );
+                        assert!(Arc::ptr_eq(&current().unwrap().shared, &shared));
+                    })
+                    .await;
+                independent
+                    .scope(async {
+                        assert!(!current().unwrap().reuses());
+                        assert!(!Arc::ptr_eq(&current().unwrap().shared, &shared));
+                    })
+                    .await;
+                assert!(Arc::ptr_eq(&current().unwrap().shared, &shared));
+            })
+            .await;
+        assert!(current().is_none());
+        // Merely enabling the cache does no I/O or unverified seeding.
+        assert!(matches!(*shared.store.lock().unwrap(), Store::Unopened));
+    }
+
     #[test]
     fn the_phone_key_is_the_untagged_sha256_of_the_udid() {
         // Pinned: changing it makes every phone's files miss once.

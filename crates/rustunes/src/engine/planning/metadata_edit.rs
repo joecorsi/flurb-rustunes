@@ -422,7 +422,7 @@ impl Catalogue {
 
 /// One validated `update_track`, decomposed. `album_artist` is `Some` exactly
 /// for the full set, which then also carries `artist` and `album`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Edit {
     pub sync_id: u64,
     pub item_pid: i64,

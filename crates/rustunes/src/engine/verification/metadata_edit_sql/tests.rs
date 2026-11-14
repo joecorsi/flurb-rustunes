@@ -480,6 +480,81 @@ fn a_comment_changes_exactly_its_cell() {
     }
 }
 
+#[test]
+fn favorites_verify_explicit_unfavorite_and_refavorite_states() {
+    for (old, new) in [(2, 1), (1, 2), (0, 2), (2, 0)] {
+        let world = World::new();
+        for path in [&world.fixture.before, &world.fixture.after] {
+            Connection::open(path)
+                .unwrap()
+                .execute_batch(&format!(
+                    "UPDATE item_stats SET liked_state={old} WHERE item_pid=3"
+                ))
+                .unwrap();
+        }
+        let before = world.before();
+        let mut phone = Phone::new();
+        phone.sql(&format!(
+            "UPDATE item_stats SET liked_state={new} WHERE item_pid=3;"
+        ));
+        phone.revise(0, 3);
+        let after = world.after(&phone.finish());
+        verify_favorites(&before, &after, &[(1003, old, new)], ANCHOR_BEFORE, false).unwrap();
+    }
+}
+
+#[test]
+fn favorites_allow_only_same_artist_representative_reselection() {
+    for variant in 0..5 {
+        let world = World::new();
+        for path in [&world.fixture.before, &world.fixture.after] {
+            Connection::open(path)
+                .unwrap()
+                .execute_batch("UPDATE item_stats SET liked_state=0 WHERE item_pid IN (3,4)")
+                .unwrap();
+        }
+        let before = world.before();
+        let mut phone = Phone::new();
+        phone.sql("UPDATE item_stats SET liked_state=2 WHERE item_pid IN (3,4); UPDATE album_artist SET representative_item_pid=4 WHERE album_artist_pid=21; UPDATE item_artist SET representative_item_pid=4 WHERE item_artist_pid=13;");
+        match variant {
+            1 => {
+                phone.sql(
+                    "UPDATE item_artist SET representative_item_pid=1 WHERE item_artist_pid=13;",
+                );
+            }
+            2 => {
+                phone.sql(
+                    "UPDATE item_artist SET item_artist='Changed name' WHERE item_artist_pid=13;",
+                );
+            }
+            3 => {
+                phone.sql(
+                    "UPDATE item_artist SET representative_item_pid=5 WHERE item_artist_pid=12;",
+                );
+            }
+            4 => {
+                phone.sql("UPDATE item SET item_artist_pid=12 WHERE item_pid=4;");
+            }
+            _ => {}
+        }
+        phone.revise(0, 3);
+        phone.revise(0, 4);
+        let after = world.after(&phone.finish());
+        let result = verify_favorites(
+            &before,
+            &after,
+            &[(1003, 0, 2), (1004, 0, 2)],
+            ANCHOR_BEFORE,
+            false,
+        );
+        if variant == 0 {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(result.is_err(), "unexpectedly accepted variant {variant}");
+        }
+    }
+}
+
 /// Seen on the phone: an album an insert batch killed mid-upload had left at
 /// keep_local_status 0, outside the edit, went to 2; its revision moved one
 /// above the session's own block and its stats revision row went.

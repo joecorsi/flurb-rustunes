@@ -90,7 +90,7 @@ pub fn prune_runs(state: &Path) -> Result<Pruned> {
         let Some(process) = name.to_str().and_then(run_process) else {
             continue;
         };
-        if entry.file_type()?.is_dir() && !Path::new(&format!("/proc/{process}")).exists() {
+        if entry.file_type()?.is_dir() && !super::process::is_alive(process) {
             candidates.push(entry.path());
         }
     }

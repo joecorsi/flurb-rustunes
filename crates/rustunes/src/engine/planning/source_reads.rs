@@ -30,6 +30,9 @@ use std::{
     },
 };
 
+mod mpeg_cache;
+pub(crate) use mpeg_cache::read as mpeg;
+
 const WORKERS: usize = 8;
 const KEEP_DAYS: i64 = 180;
 
@@ -125,6 +128,7 @@ pub(crate) fn artwork(path: &Path) -> Result<artwork::SourceArtwork> {
 /// Keep reads across runs in `directory`. Without `reuse` (full readback),
 /// every file is read and its rows rewritten. Only the first call counts.
 pub(crate) fn persist(directory: PathBuf, reuse: bool) {
+    mpeg_cache::configure(directory.clone(), reuse);
     let _ = DISK.set(Disk::new(directory, reuse));
 }
 

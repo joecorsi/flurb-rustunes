@@ -129,6 +129,7 @@ struct Declared<'a> {
     artists: BTreeSet<&'a str>,
     albums: BTreeSet<&'a str>,
     album_artists: BTreeSet<&'a str>,
+    genres: BTreeSet<&'a str>,
 }
 
 impl<'a> Declared<'a> {
@@ -139,6 +140,9 @@ impl<'a> Declared<'a> {
         let mut declared = Self::default();
         for target in targets {
             let s = target.metadata.projected()?;
+            if let Some(genre) = s.genre {
+                declared.genres.insert(genre);
+            }
             declared.artists.insert(s.artist);
             declared.albums.insert(s.album);
             declared
@@ -149,29 +153,30 @@ impl<'a> Declared<'a> {
     }
 }
 
-/// The phone matches artist, album and composer names ignoring ASCII case.
+/// The phone coalesces lookup labels across case and canonical Unicode
+/// spellings. Keep accents significant; compatibility/fuzzy matches are not
+/// sufficient evidence that two names identify the same group.
 fn same_name(a: &str, b: &str) -> bool {
-    a == b || (a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(b))
+    a == b || folded(a) == folded(b)
 }
 
-/// A name as the phone matches it.
 fn folded(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
     if name.is_ascii() {
         name.to_ascii_lowercase()
     } else {
-        name.to_owned()
+        name.to_lowercase().nfd().collect()
     }
 }
 
-/// Whether the phone renamed a group from `old` to `new`, a spelling an
-/// inserted track declared: a target naming an existing artist or album in
-/// another ASCII case gives the group its spelling.
+/// A renamed lookup must still be equivalent to its old name and use a
+/// spelling actually supplied by this batch. Unicode normalization may change
+/// its representation, but an undeclared case change remains an unrelated edit.
 fn case_renamed(old: &str, new: &str, declared: &BTreeSet<&str>) -> bool {
+    use unicode_normalization::UnicodeNormalization;
     old != new
-        && old.is_ascii()
-        && new.is_ascii()
-        && old.eq_ignore_ascii_case(new)
-        && declared.contains(new)
+        && same_name(old, new)
+        && (declared.contains(new) || declared.iter().any(|name| name.nfd().eq(new.nfd())))
 }
 
 /// Every permitted positive-to-zero recent-counter change for a prior track.
@@ -506,6 +511,16 @@ fn preserve_insert_tracks(
                 });
             }
         }
+        if let (Some(old_genre), Some(new_genre)) = (&old.metadata.genre, &mut new.metadata.genre)
+            && case_renamed(old_genre, new_genre, &declared.genres)
+        {
+            renamed.push(CaseRename {
+                kind: "track_genre",
+                id: format!("{:016x}", old.sync_id),
+                before: old_genre.clone(),
+                after: std::mem::replace(new_genre, old_genre.clone()),
+            });
+        }
         let recent_matches =
             |previous: u32, current: u32| previous == current || (previous > 0 && current == 0);
         // The session's own positive-to-zero recent-counter reset stays a
@@ -713,7 +728,7 @@ fn check_inserted(
             && same_group(&m.artist, s.artist)
             && same_group(&m.album, s.album)
             && same_group(&m.album_artist, s.effective_artist())
-            && optional(&m.genre, s.genre)
+            && same_optional(&m.genre, s.genre)
             && same_optional(&m.composer, expected_composer)
             && optional(&m.copyright, s.copyright),
         "inserted text metadata differs from the supported source projection"
@@ -798,7 +813,13 @@ fn sort_kept_or_sent(
 ) -> Result<()> {
     match (old, sent) {
         (_, Some(None)) => {}
-        (Some(old), _) => ensure!(new == old, "prior {what} changed its sort name"),
+        (Some(old), _) => ensure!(
+            new == old
+                || matches!((old.as_deref(), new.as_deref(), sent),
+                    (Some(a), Some(b), Some(Some(names)))
+                    if same_name(a, b) && names.iter().any(|name| same_name(name, b))),
+            "prior {what} changed its sort name"
+        ),
         (None, Some(Some(sorts))) => ensure!(
             new.as_deref().is_some_and(|sort| sorts.contains(sort)),
             "new {what} sort name differs from what was sent"
@@ -2167,6 +2188,93 @@ Line two' WHERE item_pid=2;
         );
         // A spelling no target declared is a changed prior track.
         b.artist = vec!["guest a".into()];
+        assert!(verify_insert_batch(&before, &after, &[compilation_expected(&b, false)]).is_err());
+    }
+
+    #[test]
+    fn a_declared_unicode_artist_rename_keeps_the_group_and_rejects_other_edits() {
+        let before = compilation_state(
+            1,
+            "UPDATE item_artist SET item_artist='Anthéne',sort_item_artist='Anthéne' WHERE item_artist_pid=141;",
+        );
+        let rename = "UPDATE item_artist SET item_artist='anthéne',sort_item_artist='anthéne' WHERE item_artist_pid=141;
+            UPDATE item SET item_artist_pid=141 WHERE item_pid=3;
+            DELETE FROM item_artist WHERE item_artist_pid=142;";
+        let after = compilation_state_at(2, 14, rename);
+        let mut source = compilation_source("B", false);
+        source.artist = vec!["anthéne".into()];
+        let targets = [compilation_expected(&source, false)];
+        let result = verify_insert_batch(&before, &after, &targets).unwrap();
+        assert!(result.case_renamed.iter().any(|r| r.kind == "track_artist"));
+        let changed = compilation_state_at(
+            2,
+            14,
+            &format!("{rename}UPDATE item_extra SET comment='Unrelated' WHERE item_pid=1;"),
+        );
+        assert!(verify_insert_batch(&before, &changed, &targets).is_err());
+        let old_sort = Some("Anthéne".to_owned());
+        let sent = Some(BTreeSet::from(["anthéne"]));
+        sort_kept_or_sent(
+            "track artist",
+            Some(&old_sort),
+            &Some("anthéne".to_owned()),
+            Some(&sent),
+        )
+        .unwrap();
+        assert!(
+            sort_kept_or_sent(
+                "track artist",
+                Some(&old_sort),
+                &Some("Different".to_owned()),
+                Some(&sent)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unicode_group_labels_preserve_accents_and_require_a_declared_spelling() {
+        for (old, new) in [
+            ("Anthéne", "anthe\u{301}ne"),
+            ("Björk", "bjo\u{308}rk"),
+            ("ÉTÉ", "e\u{301}te\u{301}"),
+        ] {
+            assert!(same_name(old, new));
+            assert_eq!(folded(old), folded(new));
+            assert!(case_renamed(old, new, &[new].into()));
+            assert!(!case_renamed(old, new, &Default::default()));
+        }
+        assert!(case_renamed(
+            "Anthéne",
+            "anthe\u{301}ne",
+            &["anthéne"].into()
+        ));
+        assert!(!same_name("Anthéne", "Anthene"));
+        assert!(!same_name("Ａ", "A"));
+        assert!(!case_renamed("Guest A", "GUEST A", &["guest a"].into()));
+    }
+
+    #[test]
+    fn a_declared_genre_case_change_preserves_existing_tracks_and_rejects_other_edits() {
+        let before = compilation_state(
+            1,
+            "INSERT INTO genre(genre_id,sync_id,genre) VALUES(71,0,'Drum & Bass'); UPDATE item SET genre_id=71 WHERE item_pid=2;",
+        );
+        let after = compilation_state_at(
+            2,
+            14,
+            "INSERT INTO genre(genre_id,sync_id,genre) VALUES(71,0,'drum & bass'); UPDATE item SET genre_id=71 WHERE item_pid IN(2,3);",
+        );
+        let mut b = compilation_source("B", false);
+        b.genre = vec!["drum & bass".into()];
+        let result =
+            verify_insert_batch(&before, &after, &[compilation_expected(&b, false)]).unwrap();
+        assert!(result.case_renamed.iter().any(|r| r.kind == "track_genre"
+            && r.before == "Drum & Bass"
+            && r.after == "drum & bass"));
+        b.genre = vec!["DRUM & BASS".into()];
+        assert!(verify_insert_batch(&before, &after, &[compilation_expected(&b, false)]).is_err());
+        b.genre = vec!["House".into()];
         assert!(verify_insert_batch(&before, &after, &[compilation_expected(&b, false)]).is_err());
     }
 

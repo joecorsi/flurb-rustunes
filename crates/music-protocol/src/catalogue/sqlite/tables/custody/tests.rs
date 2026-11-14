@@ -21,7 +21,7 @@ struct Case {
 }
 impl Case {
     fn new() -> Self {
-        let directory = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "sql-custody-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -308,9 +308,7 @@ fn parent_holds_dms(fd: i32) -> bool {
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
     for fd in pipe {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0
-            || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0
-        {
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0 {
             unsafe {
                 libc::close(pipe[0]);
                 libc::close(pipe[1]);

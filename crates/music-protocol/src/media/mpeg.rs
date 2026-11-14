@@ -6,11 +6,11 @@
 //!
 //! [`audio_source`]: crate::media::audio_source
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom},
     os::unix::fs::OpenOptionsExt,
     path::Path,
@@ -20,19 +20,50 @@ pub mod gapless;
 pub mod projection;
 pub mod timing;
 
-const MAX_BYTES: u64 = 512 * 1024 * 1024;
+// Cached inspection labels are a finite vocabulary; never leak input strings
+// to manufacture a static lifetime.
+pub(crate) fn cached_word<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<&'static str, D::Error> {
+    let word = String::deserialize(d)?;
+    for known in [
+        "encoded-mpeg1-layer3",
+        "encoded-audio",
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "music-protocol.mpeg-source-timing",
+        "LAME",
+        "Lavf",
+        "Lavc",
+        "itunsmpb",
+        "lame_tag",
+        "smpb_frame",
+        "analysis",
+    ] {
+        if word == known {
+            return Ok(known);
+        }
+    }
+    Err(serde::de::Error::custom("unknown cached MPEG label"))
+}
+
+pub type InspectionLabel = &'static str;
+
+const MAX_BYTES: u64 = crate::protocol::transfer::MAX_AUDIO;
 const MAX_TAG: usize = 16 * 1024 * 1024;
 const MAX_TEXT: usize = 64 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
     pub file_bytes: u64,
     pub full_file_sha256: String,
     pub audio: EncodedMpeg,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncodedMpeg {
-    pub format: &'static str,
+    #[serde(deserialize_with = "crate::media::mpeg::cached_word")]
+    pub format: InspectionLabel,
     pub sha256: String,
     pub frame_bytes_sha256: String,
     pub sample_rate: u32,
@@ -41,7 +72,8 @@ pub struct EncodedMpeg {
     pub audio_bytes: u64,
     pub coded_samples: u64,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Tags {
     pub title: Vec<String>,
     pub artist: Vec<String>,
@@ -94,22 +126,23 @@ impl Tags {
         texts
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     pub language: String,
     pub description: String,
     pub text: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrameEvidence {
     pub id: String,
     pub bytes: usize,
     pub sha256: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Picture {
     /// What the bytes are, whatever the container declared.
-    pub mime: &'static str,
+    #[serde(deserialize_with = "crate::media::mpeg::cached_word")]
+    pub mime: InspectionLabel,
     /// The container declared an image type (see [`image_facts`]), as FFmpeg
     /// needs to read a FLAC's picture; not in the JSON.
     #[serde(skip)]
@@ -140,6 +173,9 @@ pub struct Source {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apple_timing: Option<gapless::AppleTiming>,
     pub metadata: Tags,
+    /// Sync display fallback for an untitled MP3; not an on-disk title tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_title: Option<String>,
     pub id3_version: Option<u8>,
     pub frames: Vec<FrameEvidence>,
     pub artwork: Vec<Picture>,
@@ -247,7 +283,16 @@ pub fn read(path: &Path) -> Result<Source> {
         same(&before, &file.metadata()?),
         "MP3 source changed before open"
     );
-    let result = read_file(&mut file, before.len())?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, &mut file);
+    let mut result = read_file(&mut reader, before.len())?;
+    drop(reader);
+    if result.stream.is_none()
+        && crate::media::metadata::tag_values(&result.metadata.title)
+            .next()
+            .is_none()
+    {
+        result.fallback_title = path.file_stem().and_then(|v| v.to_str()).map(str::to_owned);
+    }
     ensure!(
         same(&before, &file.metadata()?) && same(&before, &fs::symlink_metadata(path)?),
         "MP3 source changed during inspection"
@@ -255,7 +300,7 @@ pub fn read(path: &Path) -> Result<Source> {
     Ok(result)
 }
 use crate::media::held_source::same_file as same;
-fn read_file(file: &mut File, size: u64) -> Result<Source> {
+fn read_file(file: &mut (impl Read + Seek), size: u64) -> Result<Source> {
     if size >= 12 {
         let mut reader = std::io::BufReader::new(&mut *file);
         if let Some(layout) = crate::media::container::inspect(&mut reader, size)? {
@@ -293,11 +338,14 @@ fn read_file(file: &mut File, size: u64) -> Result<Source> {
         },
     )?;
     let full = hash_span(file, 0, size)?;
-    ensure!(audio_offset <= MAX_TAG as u64 + 20, "ID3 exceeds bound");
+    // Read only declared metadata into memory; padding is streamed separately.
+    let tag_length = crate::media::container::mpeg::id3v2_length(file, size)?.unwrap_or(0);
+    ensure!(tag_length <= MAX_TAG as u64 + 20, "ID3 exceeds bound");
     file.rewind()?;
-    let mut tag = vec![0; audio_offset as usize];
+    let mut tag = vec![0; tag_length as usize];
     file.read_exact(&mut tag)?;
-    let (metadata, version, frames, artwork) = parse_id3(&tag)?;
+    let (metadata, version, frames, artwork) =
+        parse_id3(&tag).context("audio frames validated, but ID3 metadata could not be read")?;
     let apple_timing = gapless::analyse(file, audio_offset, audio_bytes, &metadata.encoder_hints)
         .context("Apple's MPEG timing")?;
     // ID3v1 is retained by full-file identity but cannot silently override or
@@ -322,6 +370,7 @@ fn read_file(file: &mut File, size: u64) -> Result<Source> {
         stream: None,
         apple_timing: Some(apple_timing),
         metadata,
+        fallback_title: None,
         id3_version: version,
         frames,
         artwork,
@@ -331,7 +380,7 @@ fn read_file(file: &mut File, size: u64) -> Result<Source> {
     source.transferred_identity()?;
     Ok(source)
 }
-fn hash_span(file: &mut File, start: u64, bytes: u64) -> Result<[u8; 32]> {
+fn hash_span(file: &mut (impl Read + Seek), start: u64, bytes: u64) -> Result<[u8; 32]> {
     file.seek(SeekFrom::Start(start))?;
     let mut left = bytes;
     let mut buffer = [0; 65536];
@@ -365,68 +414,146 @@ pub(crate) fn parse_id3_with_picture(
     let mut tags = Tags::default();
     let mut evidence = Vec::new();
     let mut pictures = Vec::new();
-    if bytes.is_empty() {
+    if bytes.iter().all(|b| *b == 0) {
         return Ok((tags, None, evidence, pictures));
     }
     ensure!(
-        bytes.len() >= 10 && &bytes[..3] == b"ID3" && matches!(bytes[3], 3 | 4) && bytes[4] == 0,
+        bytes.len() >= 10
+            && &bytes[..3] == b"ID3"
+            && matches!(bytes[3], 2 | 3 | 4)
+            && bytes[4] == 0,
         "unsupported ID3 version"
     );
-    // Refuse unsynchronisation, extended headers, encryption/compression and
-    // experimental layouts rather than treating encoded bytes as metadata.
+    // Experimental is an advisory flag. Extended headers have explicit sizes.
+    // Unsynchronisation/compression still require their own decoding path.
+    let allowed = if bytes[3] == 2 {
+        0
+    } else if bytes[3] == 3 {
+        0x60
+    } else {
+        0x70
+    };
     ensure!(
-        bytes[5] == 0 || (bytes[3] == 4 && bytes[5] == 0x10),
-        "unsupported ID3 header flags"
+        bytes[5] & !allowed == 0,
+        "unsupported ID3 header transformation"
     );
     let version = bytes[3];
     let end = 10 + syncsafe(&bytes[6..10])?;
     ensure!(
-        end <= bytes.len() && bytes.len() == end + if bytes[5] & 0x10 != 0 { 10 } else { 0 },
+        end <= bytes.len()
+            && bytes
+                .get(end + if bytes[5] & 0x10 != 0 { 10 } else { 0 }..)
+                .is_some_and(|rest| rest.iter().all(|b| matches!(*b, 0 | b' '))),
         "ID3 span mismatch"
     );
     let mut offset = 10;
+    if bytes[5] & 0x40 != 0 {
+        ensure!(end >= 14, "truncated ID3 extended header");
+        if version == 3 {
+            let length = u32::from_be_bytes(bytes[10..14].try_into()?) as usize;
+            ensure!(
+                length >= 6 && length <= end - 14,
+                "invalid ID3v2.3 extended header size"
+            );
+            let flags = u16::from_be_bytes(bytes[14..16].try_into()?);
+            ensure!(
+                flags & !0x8000 == 0 && length == if flags & 0x8000 != 0 { 10 } else { 6 },
+                "invalid ID3v2.3 extended header flags"
+            );
+            offset = 14 + length;
+        } else {
+            let length = syncsafe(&bytes[10..14])?;
+            ensure!(
+                length >= 6 && length <= end - 10 && bytes[14] == 1 && bytes[15] & !0x70 == 0,
+                "invalid ID3v2.4 extended header"
+            );
+            let mut at = 16;
+            for (flag, count) in [(0x40, 0), (0x20, 5), (0x10, 1)] {
+                if bytes[15] & flag != 0 {
+                    ensure!(
+                        at < 10 + length
+                            && bytes[at] == count
+                            && at + 1 + count as usize <= 10 + length,
+                        "invalid ID3 extended header flag data"
+                    );
+                    at += 1 + count as usize;
+                }
+            }
+            ensure!(at == 10 + length, "ID3 extended header span mismatch");
+            offset = at;
+        }
+    }
     let mut seen = BTreeMap::<String, usize>::new();
     let mut text_total = 0usize;
     while offset < end {
-        if bytes[offset] == 0 {
+        if matches!(bytes[offset], 0 | b' ') {
             ensure!(
-                bytes[offset..end].iter().all(|b| *b == 0),
-                "nonzero ID3 padding"
+                bytes[offset..end].iter().all(|b| matches!(*b, 0 | b' ')),
+                "invalid bytes in ID3 padding"
             );
             break;
         }
+        let header = if version == 2 { 6 } else { 10 };
+        let id_bytes = if version == 2 { 3 } else { 4 };
         ensure!(
-            evidence.len() < 4096 && end - offset >= 10,
+            evidence.len() < 4096 && end - offset >= header,
             "ID3 frame count/header bound"
         );
-        let id = &bytes[offset..offset + 4];
+        let id = &bytes[offset..offset + id_bytes];
         ensure!(
             id.iter()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
             "invalid ID3 frame ID"
         );
         let id = std::str::from_utf8(id)?.to_owned();
-        let len = if version == 4 {
+        let len = if version == 2 {
+            bytes[offset + 3..offset + 6]
+                .iter()
+                .fold(0usize, |n, b| (n << 8) | usize::from(*b))
+        } else if version == 4 {
             syncsafe(&bytes[offset + 4..offset + 8])?
         } else {
             u32::from_be_bytes(bytes[offset + 4..offset + 8].try_into()?) as usize
         };
-        ensure!(
-            len > 0 && len <= end - offset - 10,
-            "invalid ID3 frame extent"
-        );
-        ensure!(
-            bytes[offset + 8..offset + 10] == [0, 0],
-            "unsupported ID3 frame flags"
-        );
-        let data = &bytes[offset + 10..offset + 10 + len];
+        ensure!(len <= end - offset - header, "invalid ID3 frame extent");
+        if version != 2 {
+            let status_mask = if version == 3 { 0xe0 } else { 0x70 };
+            ensure!(
+                bytes[offset + 8] & !status_mask == 0 && bytes[offset + 9] == 0,
+                "unsupported ID3 frame flags"
+            );
+        }
+        let raw_data = &bytes[offset + header..offset + header + len];
+        if len == 0 {
+            offset += header;
+            continue;
+        }
+        let mapped = if version == 2 {
+            lofty::id3::v2::upgrade_v2(&id).unwrap_or(id.as_str())
+        } else {
+            &id
+        };
+        let legacy_picture;
+        let data = if version == 2 && mapped == "APIC" {
+            ensure!(raw_data.len() >= 5, "truncated ID3v2.2 picture");
+            let mime: &[u8] = match &raw_data[1..4] {
+                b"JPG" => b"image/jpeg",
+                b"PNG" => b"image/png",
+                b"GIF" => b"image/gif",
+                _ => anyhow::bail!("unsupported ID3v2.2 picture format"),
+            };
+            legacy_picture = [&raw_data[..1], mime, b"\0", &raw_data[4..]].concat();
+            legacy_picture.as_slice()
+        } else {
+            raw_data
+        };
         evidence.push(FrameEvidence {
             id: id.clone(),
             bytes: len,
-            sha256: hex(&Sha256::digest(data)),
+            sha256: hex(&Sha256::digest(raw_data)),
         });
-        *seen.entry(id.clone()).or_default() += 1;
-        let target = match id.as_str() {
+        *seen.entry(mapped.to_owned()).or_default() += 1;
+        let target = match mapped {
             "TIT2" => Some(&mut tags.title),
             "TPE1" => Some(&mut tags.artist),
             "TALB" => Some(&mut tags.album),
@@ -443,21 +570,23 @@ pub(crate) fn parse_id3_with_picture(
             _ => None,
         };
         if let Some(target) = target {
-            let values = text_frame(data, version)?;
+            let values = text_frame(data, version)
+                .with_context(|| format!("reading ID3 {id} frame at byte {offset}"))?;
             text_total += values.iter().map(String::len).sum::<usize>();
             target.extend(values);
             ensure!(
                 target.len() <= 32 && text_total <= MAX_TEXT,
                 "ID3 text exceeds bound"
             );
-        } else if matches!(id.as_str(), "TRCK" | "TPOS" | "TCMP") {
-            ensure!(seen[&id] == 1, "duplicate ID3 numeric frame");
-            let values = text_frame(data, version)?;
+        } else if matches!(mapped, "TRCK" | "TPOS" | "TCMP") {
+            ensure!(seen[mapped] == 1, "duplicate ID3 numeric frame");
+            let values = text_frame(data, version)
+                .with_context(|| format!("reading ID3 {id} frame at byte {offset}"))?;
             // An empty number is no number, as an empty text is no text.
             let values: Vec<_> = crate::media::metadata::tag_values(&values).collect();
             ensure!(values.len() <= 1, "ambiguous ID3 numeric frame");
             if let Some(&value) = values.first() {
-                if id == "TCMP" {
+                if mapped == "TCMP" {
                     tags.compilation = Some(match value {
                         "0" => false,
                         "1" => true,
@@ -465,7 +594,7 @@ pub(crate) fn parse_id3_with_picture(
                     });
                 } else {
                     let (number, total) = number_pair(value)?;
-                    if id == "TRCK" {
+                    if mapped == "TRCK" {
                         tags.track = Some(number);
                         tags.track_total = total;
                     } else {
@@ -474,7 +603,7 @@ pub(crate) fn parse_id3_with_picture(
                     }
                 }
             }
-        } else if matches!(id.as_str(), "TENC" | "TSSE") {
+        } else if matches!(mapped, "TENC" | "TSSE") {
             // Only Apple's gapless rule reads these; one it cannot decode
             // names no encoder.
             if let Some(text) = text_frame(data, version)
@@ -483,8 +612,10 @@ pub(crate) fn parse_id3_with_picture(
             {
                 tags.encoder_hints.encoder(&text);
             }
-        } else if id == "COMM" {
-            if let Some(comment) = comment_frame(data, version)? {
+        } else if mapped == "COMM" {
+            if let Some(comment) = comment_frame(data, version)
+                .with_context(|| format!("reading ID3 {id} frame at byte {offset}"))?
+            {
                 tags.encoder_hints
                     .comment(&comment.description, &comment.text);
                 text_total += comment.description.len() + comment.text.len();
@@ -494,13 +625,14 @@ pub(crate) fn parse_id3_with_picture(
                     "ID3 comments exceed bound"
                 );
             }
-        } else if id == "APIC" {
+        } else if mapped == "APIC" {
             ensure!(pictures.len() < 8, "too many ID3 pictures");
-            let (facts, image) = picture_payload(data, version)?;
+            let (facts, image) = picture_payload(data, version)
+                .with_context(|| format!("reading ID3 {id} frame at byte {offset}"))?;
             on_picture(&facts, image)?;
             pictures.push(facts);
         }
-        offset += 10 + len;
+        offset += header + len;
     }
     Ok((tags, Some(version), evidence, pictures))
 }
@@ -524,10 +656,7 @@ fn comment_frame(data: &[u8], version: u8) -> Result<Option<Comment>> {
         * width;
     let decode = |bytes: &[u8]| -> Result<String> {
         if bytes.is_empty() {
-            ensure!(
-                encoding <= 3 && (version == 4 || encoding <= 1),
-                "invalid ID3 comment encoding"
-            );
+            ensure!(encoding <= 3, "invalid ID3 comment encoding");
             return Ok(String::new());
         }
         decode_text(encoding, bytes, version)
@@ -570,14 +699,18 @@ fn text_frame(data: &[u8], version: u8) -> Result<Vec<String>> {
     ensure!(values.len() <= 32, "ID3 text value bound");
     Ok(values)
 }
-fn decode_text(encoding: u8, data: &[u8], version: u8) -> Result<String> {
-    ensure!(
-        version == 4 || encoding <= 1,
-        "ID3v2.3 text encoding unsupported"
-    );
+fn decode_text(encoding: u8, data: &[u8], _version: u8) -> Result<String> {
+    // Cleared fields can contain only the encoding byte. No text means there
+    // is no byte order to infer, even if the writer omitted a UTF-16 BOM.
+    if data.is_empty() {
+        ensure!(encoding <= 3, "unknown ID3 text encoding");
+        return Ok(String::new());
+    }
+    // Read the declared encoding even when a writer put UTF-8 in a v2.3 tag.
+    // Replacement characters describe malformed text; the source stays intact.
     let s = match encoding {
         0 => data.iter().map(|v| char::from(*v)).collect(),
-        3 => std::str::from_utf8(data)?.to_owned(),
+        3 => String::from_utf8_lossy(data).into_owned(),
         1 | 2 => {
             let (le, raw) = if encoding == 1 {
                 ensure!(data.len() >= 2, "missing UTF16 BOM");
@@ -589,7 +722,6 @@ fn decode_text(encoding: u8, data: &[u8], version: u8) -> Result<String> {
             } else {
                 (false, data)
             };
-            ensure!(raw.len() % 2 == 0, "odd UTF16 span");
             let words: Vec<u16> = raw
                 .chunks_exact(2)
                 .map(|b| {
@@ -600,7 +732,11 @@ fn decode_text(encoding: u8, data: &[u8], version: u8) -> Result<String> {
                     }
                 })
                 .collect();
-            String::from_utf16(&words)?
+            let mut text = String::from_utf16_lossy(&words);
+            if raw.len() % 2 != 0 && raw.last() != Some(&0) {
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+            text
         }
         _ => anyhow::bail!("unknown ID3 text encoding"),
     };
@@ -634,10 +770,7 @@ fn picture_payload(data: &[u8], version: u8) -> Result<(Picture, &[u8])> {
         .context("APIC description terminator missing")?
         * width;
     let description = if terminator == 0 {
-        ensure!(
-            encoding <= 3 && (version == 4 || encoding <= 1),
-            "invalid APIC encoding"
-        );
+        ensure!(encoding <= 3, "invalid APIC encoding");
         String::new()
     } else {
         decode_text(encoding, &rest[..terminator], version)?
@@ -669,15 +802,15 @@ pub(crate) fn declares_type(mime: &[u8]) -> bool {
 
 /// What a picture's bytes are: a JPEG of any kind or a PNG, the two cover types
 /// Apple's sync sends unchanged, or a GIF, BMP or TIFF, which it converts (and
-/// which sync sends as a JPEG, [`bitmap::to_jpeg`]). A declared type must agree
-/// with the bytes. An empty type, or a bare `image/`, declares nothing (ID3v2.3
+/// which sync sends as a JPEG, [`bitmap::to_jpeg`]). The validated bytes take
+/// precedence over a recognized but incorrectly declared MIME type. An empty type, or a bare `image/`, declares nothing (ID3v2.3
 /// reads an omitted one as `image/`, and taggers leave it empty in FLAC): the
 /// bytes alone decide, and still have to be one of those types.
 ///
 /// [`bitmap::to_jpeg`]: crate::media::bitmap::to_jpeg
 pub(crate) fn image_facts(mime: &[u8], image: &[u8]) -> Result<(&'static str, (u16, u16))> {
     use crate::media::bitmap::Format;
-    let declared = match mime.to_ascii_lowercase().as_slice() {
+    match mime.to_ascii_lowercase().as_slice() {
         _ if !declares_type(mime) => None,
         b"image/jpeg" | b"image/jpg" => Some("image/jpeg"),
         b"image/png" => Some("image/png"),
@@ -694,11 +827,6 @@ pub(crate) fn image_facts(mime: &[u8], image: &[u8]) -> Result<(&'static str, (u
     } else {
         Format::of(image).map_or("image/jpeg", Format::mime)
     };
-    ensure!(
-        declared.is_none_or(|declared| declared == held),
-        "a picture declared {:?} holds other image data",
-        String::from_utf8_lossy(mime)
-    );
     Ok((
         held,
         match held {
@@ -785,6 +913,38 @@ pub fn read_front_cover(path: &Path, expected: &Source) -> Result<Option<Embedde
     let tag = bytes
         .get(..usize::try_from(expected.audio_offset)?)
         .context("MP3 tag span differs")?;
+    cover_from_tag(tag, expected)
+}
+
+/// Extract and validate only ID3 picture/tag bytes. The caller must bind the
+/// whole audio file separately at upload; this does not verify its audio bytes.
+pub fn read_front_cover_for_upload(
+    path: &Path,
+    expected: &Source,
+) -> Result<Option<EmbeddedCover>> {
+    if expected.stream.is_some() {
+        return read_front_cover(path, expected);
+    }
+    if cover_index(&expected.artwork).is_none() {
+        return Ok(None);
+    }
+    let identity = expected.transferred_identity()?;
+    let mut held =
+        crate::media::held_source::BoundSource::open_for_upload(path, identity.file_bytes)?;
+    let length =
+        crate::media::container::mpeg::id3v2_length(held.file(), identity.file_bytes)?.unwrap_or(0);
+    ensure!(
+        length <= MAX_TAG as u64 + 20,
+        "ID3 picture prefix exceeds bound"
+    );
+    held.file().rewind()?;
+    let mut tag = vec![0; length as usize];
+    held.file().read_exact(&mut tag)?;
+    held.check()?;
+    cover_from_tag(&tag, expected)
+}
+
+fn cover_from_tag(tag: &[u8], expected: &Source) -> Result<Option<EmbeddedCover>> {
     let chosen = cover_index(&expected.artwork);
     let (mut front, mut at) = (None, 0);
     let (tags, version, frames, pictures) = parse_id3_with_picture(tag, &mut |facts, image| {

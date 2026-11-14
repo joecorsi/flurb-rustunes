@@ -331,6 +331,7 @@ pub(super) fn covered(result: &CoverResult) -> String {
 
 pub(super) fn observation_line(event: &Observation<'_>) -> String {
     match event {
+        Observation::PreparingTransferAssets{done,total}=>format!("Prepared transfer assets {done}/{total}"),
         Observation::CapturingCatalogue => "Copying the phone's Music catalogue".into(),
         Observation::SourcesInspected { total, .. } => format!("Inspected {total} sources"),
         Observation::RevalidatingSources { done, total } => {

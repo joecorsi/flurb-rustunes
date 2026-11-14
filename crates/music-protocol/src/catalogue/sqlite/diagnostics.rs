@@ -2,12 +2,16 @@
 //! This deliberately does not produce a Catalog suitable for planning writes.
 //! Broken joins become diagnostic counts rather than inferred identities.
 use anyhow::{Context, Result, ensure};
-use std::collections::BTreeMap;
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// Inspect only existing rows. No schema repair, identity synthesis, or writes.
-pub(super) fn inspect(connection: &Connection, compare_playlist: Option<&str>, full_inventory: bool) -> Result<Value> {
+pub(super) fn inspect(
+    connection: &Connection,
+    compare_playlist: Option<&str>,
+    full_inventory: bool,
+) -> Result<Value> {
     let mut warnings = Vec::<Value>::new();
     let mut report = json!({
         "source": "read_only_sqlite_diagnostics",
@@ -77,8 +81,7 @@ pub(super) fn inspect(connection: &Connection, compare_playlist: Option<&str>, f
             })),
         }
     }
-    let (playlists, favorites, playlist_warnings) =
-        super::playlist_inspection::inspect(connection);
+    let (playlists, favorites, playlist_warnings) = super::playlist_inspection::inspect(connection);
     report["playlists"] = playlists;
     report["favorites"] = favorites;
     if let Some(name) = compare_playlist {
@@ -97,14 +100,17 @@ pub(super) fn inspect(connection: &Connection, compare_playlist: Option<&str>, f
 }
 
 /// A JSON export must either include every matching row or fail explicitly.
-fn detailed_inventory(connection: &Connection) -> Result<(Vec<Value>, Vec<Value>, BTreeMap<String, Vec<Value>>)> {
+fn detailed_inventory(
+    connection: &Connection,
+) -> Result<(Vec<Value>, Vec<Value>, BTreeMap<String, Vec<Value>>)> {
     const MAX_TRACKS: usize = 100_000;
     const MAX_ALBUMS: usize = 100_000;
     const MAX_MEMBERS: usize = 1_000_000;
 
     let mut tracks = Vec::new();
-    let mut query = connection.prepare(
-        "SELECT s.sync_id, i.item_pid, e.title, ia.item_artist, a.album,
+    let mut query = connection
+        .prepare(
+            "SELECT s.sync_id, i.item_pid, e.title, ia.item_artist, a.album,
                 aa.album_artist, i.track_number, e.track_count, i.disc_number,
                 e.disc_count, e.year, e.total_time_ms, e.file_size,
                 g.genre, co.composer, st.liked_state, st.play_count_user,
@@ -118,8 +124,9 @@ fn detailed_inventory(connection: &Connection) -> Result<(Vec<Value>, Vec<Value>
          LEFT JOIN composer co ON co.composer_pid=i.composer_pid
          LEFT JOIN item_stats st USING(item_pid)
          WHERE i.media_type=8 AND s.sync_id<>0
-         ORDER BY s.sync_id"
-    ).context("prepare detailed track inventory")?;
+         ORDER BY s.sync_id",
+        )
+        .context("prepare detailed track inventory")?;
     for result in query.query_map([], |row| {
         let wire_id: i64 = row.get(0)?;
         Ok(json!({
@@ -143,21 +150,26 @@ fn detailed_inventory(connection: &Connection) -> Result<(Vec<Value>, Vec<Value>
             "skip_count": row.get::<_, Option<i64>>(17)?
         }))
     })? {
-        ensure!(tracks.len() < MAX_TRACKS, "track inventory exceeds {MAX_TRACKS} rows");
+        ensure!(
+            tracks.len() < MAX_TRACKS,
+            "track inventory exceeds {MAX_TRACKS} rows"
+        );
         tracks.push(result.context("read detailed track row")?);
     }
     drop(query);
 
     let mut albums = Vec::new();
-    let mut query = connection.prepare(
-        "SELECT a.album_pid, a.sync_id, a.album, aa.album_artist, COUNT(*)
+    let mut query = connection
+        .prepare(
+            "SELECT a.album_pid, a.sync_id, a.album, aa.album_artist, COUNT(*)
          FROM album a JOIN item i ON i.album_pid=a.album_pid
          JOIN item_store s ON s.item_pid=i.item_pid
          LEFT JOIN album_artist aa ON aa.album_artist_pid=a.album_artist_pid
          WHERE i.media_type=8 AND s.sync_id<>0
          GROUP BY a.album_pid, a.sync_id, a.album, aa.album_artist
-         ORDER BY aa.album_artist, a.album, a.album_pid"
-    ).context("prepare album inventory")?;
+         ORDER BY aa.album_artist, a.album, a.album_pid",
+        )
+        .context("prepare album inventory")?;
     for result in query.query_map([], |row| {
         let wire_id: i64 = row.get(1)?;
         Ok(json!({
@@ -168,20 +180,25 @@ fn detailed_inventory(connection: &Connection) -> Result<(Vec<Value>, Vec<Value>
             "tracks": row.get::<_, i64>(4)?
         }))
     })? {
-        ensure!(albums.len() < MAX_ALBUMS, "album inventory exceeds {MAX_ALBUMS} rows");
+        ensure!(
+            albums.len() < MAX_ALBUMS,
+            "album inventory exceeds {MAX_ALBUMS} rows"
+        );
         albums.push(result.context("read album row")?);
     }
     drop(query);
 
     let mut membership = BTreeMap::<String, Vec<Value>>::new();
     let mut total = 0usize;
-    let mut query = connection.prepare(
-        "SELECT ci.container_pid, ci.position, ci.item_pid, i.media_type, s.sync_id
+    let mut query = connection
+        .prepare(
+            "SELECT ci.container_pid, ci.position, ci.item_pid, i.media_type, s.sync_id
          FROM container_item ci
          LEFT JOIN item i ON i.item_pid=ci.item_pid
          LEFT JOIN item_store s ON s.item_pid=ci.item_pid
-         ORDER BY ci.container_pid, ci.position, ci.container_item_pid"
-    ).context("prepare playlist membership inventory")?;
+         ORDER BY ci.container_pid, ci.position, ci.container_item_pid",
+        )
+        .context("prepare playlist membership inventory")?;
     for result in query.query_map([], |row| {
         let wire_id: Option<i64> = row.get(4)?;
         Ok((
@@ -192,17 +209,19 @@ fn detailed_inventory(connection: &Connection) -> Result<(Vec<Value>, Vec<Value>
                 "media_type": row.get::<_, Option<i64>>(3)?,
                 "track_id": wire_id.filter(|id| *id != 0)
                     .map(|id| format!("{:016x}", id as u64))
-            })
+            }),
         ))
     })? {
-        ensure!(total < MAX_MEMBERS, "playlist inventory exceeds {MAX_MEMBERS} member rows");
+        ensure!(
+            total < MAX_MEMBERS,
+            "playlist inventory exceeds {MAX_MEMBERS} member rows"
+        );
         let (playlist_id, member) = result.context("read membership row")?;
         membership.entry(playlist_id).or_default().push(member);
         total += 1;
     }
     Ok((tracks, albums, membership))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -219,14 +238,21 @@ mod tests {
         let report = inspect(&fixture.connection, None, false).unwrap();
         assert_eq!(report["stats"]["tracks"], 1);
         let warnings = report["warnings"].as_array().unwrap();
-        assert!(warnings.iter().any(|issue| {
-            issue["code"] == "albums_without_artist" && issue["count"] == 1
-        }));
+        assert!(
+            warnings
+                .iter()
+                .any(|issue| { issue["code"] == "albums_without_artist" && issue["count"] == 1 })
+        );
         assert!(warnings.iter().any(|issue| {
             issue["code"] == "tracks_in_albums_without_artist" && issue["count"] == 1
         }));
-        let pid: i64 = fixture.connection
-            .query_row("SELECT album_artist_pid FROM album WHERE album_pid=31", [], |row| row.get(0))
+        let pid: i64 = fixture
+            .connection
+            .query_row(
+                "SELECT album_artist_pid FROM album WHERE album_pid=31",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(pid, 0);
     }
@@ -234,29 +260,38 @@ mod tests {
     #[test]
     fn full_inventory_has_track_metadata_album_and_ordered_membership() {
         let fixture = Fixture::new(false);
-        fixture.connection.execute_batch(
-            "ALTER TABLE container ADD COLUMN name TEXT;
+        fixture
+            .connection
+            .execute_batch(
+                "ALTER TABLE container ADD COLUMN name TEXT;
              UPDATE container SET name='Primary Library';
              INSERT INTO container VALUES(82,-82,'Road Trip');
              CREATE TABLE container_item(
                  container_item_pid INTEGER PRIMARY KEY,
                  container_pid INTEGER, item_pid INTEGER, position INTEGER
              );
-             INSERT INTO container_item VALUES(1,82,1,7);"
-        ).unwrap();
+             INSERT INTO container_item VALUES(1,82,1,7);",
+            )
+            .unwrap();
         let report = inspect(&fixture.connection, None, true).unwrap();
         assert_eq!(report["tracks"][0]["id"], "ffffffffffffffff");
         assert_eq!(report["tracks"][0]["title"], "Synthetic Title");
         assert_eq!(report["tracks"][0]["album"], "Synthetic Album");
         assert_eq!(report["albums"][0]["name"], "Synthetic Album");
         assert_eq!(report["playlist_membership"]["82"][0]["position"], 7);
-        assert_eq!(report["playlist_membership"]["82"][0]["track_id"], "ffffffffffffffff");
+        assert_eq!(
+            report["playlist_membership"]["82"][0]["track_id"],
+            "ffffffffffffffff"
+        );
     }
 
     #[test]
     fn unexpected_schema_is_a_diagnostic_instead_of_a_parser_failure() {
         let fixture = Fixture::new(false);
-        fixture.connection.execute_batch("DROP TABLE album_artist").unwrap();
+        fixture
+            .connection
+            .execute_batch("DROP TABLE album_artist")
+            .unwrap();
         let report = inspect(&fixture.connection, None, false).unwrap();
         assert_eq!(report["stats"]["tracks"], 1);
         assert!(report["warnings"].as_array().unwrap().iter().any(|issue| {

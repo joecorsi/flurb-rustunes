@@ -33,9 +33,14 @@ use std::{
 use tokio::time::{Instant, timeout_at};
 
 pub const MAX_ASSET: u64 = 32 * 1024 * 1024;
-/// Separate production audio bound; every other write_new (covers, the
-/// metadata pair) keeps MAX_ASSET, 32 MiB.
-pub const MAX_AUDIO: u64 = 64 * 1024 * 1024;
+/// Audio sizes must fit the phone catalogue's signed 64-bit size field.
+/// This is a representation bound, not an application file-size policy.
+/// Artwork and metadata writes retain their separate small bounds.
+pub const MAX_AUDIO: u64 = i64::MAX as u64;
+/// Finite per-file I/O allowance derived from the largest representable audio
+/// file, using the smallest (64 KiB) readback chunks. Actual connections still
+/// receive only the allowance calculated for their selected files.
+pub const MAX_AUDIO_SESSION_OPS: usize = (MAX_AUDIO / (64 * 1024) * 3 + 65536) as usize;
 pub const MAX_CATALOG: u64 = 64 * 1024 * 1024;
 const MAX_OPS: usize = 4096;
 const SUMMARY_FRAMES: usize = 8;
@@ -236,7 +241,7 @@ impl Transfer {
         operations: usize,
     ) -> Result<Self> {
         ensure!(
-            (1..=MAX_SESSION_OPS).contains(&operations),
+            (1..=MAX_AUDIO_SESSION_OPS).contains(&operations),
             "AFC operation allowance exceeds bound"
         );
         control.check()?;
@@ -399,7 +404,7 @@ impl Transfer {
         readonly_summary: bool,
     ) -> Result<Self> {
         ensure!(
-            (1..=MAX_SESSION_OPS).contains(&operations),
+            (1..=MAX_AUDIO_SESSION_OPS).contains(&operations),
             "AFC operation allowance exceeds bound"
         );
         ensure!(
@@ -801,9 +806,10 @@ impl Transfer {
                     )?;
                 }
                 let expected = match operation {
-                    AfcOpcode::GetFileInfo | AfcOpcode::ReadDir | AfcOpcode::Read => {
-                        AfcOpcode::Data
-                    }
+                    AfcOpcode::GetDevInfo
+                    | AfcOpcode::GetFileInfo
+                    | AfcOpcode::ReadDir
+                    | AfcOpcode::Read => AfcOpcode::Data,
                     AfcOpcode::FileOpen => AfcOpcode::FileOpenRes,
                     AfcOpcode::Write
                     | AfcOpcode::FileSetSize
@@ -1134,6 +1140,23 @@ impl Transfer {
         input: &mut impl Read,
         size: u64,
     ) -> Result<[u8; 32]> {
+        ensure!(size > 0 && size <= MAX_AUDIO, "invalid audio size");
+        self.require_writable("write_audio_new")?;
+        let packet = Self::packet(
+            self.op(AfcOpcode::GetDevInfo, Vec::new(), Vec::new())
+                .await?,
+            AfcOpcode::Data,
+        )?;
+        let fields: Vec<_> = packet.payload.split(|b| *b == 0).collect();
+        let free = fields
+            .chunks_exact(2)
+            .find(|pair| pair[0] == b"FSFreeBytes")
+            .context("iPhone did not report available audio storage")?;
+        let free: u64 = std::str::from_utf8(free[1])?.parse()?;
+        ensure!(
+            free >= size,
+            "Not enough free space on iPhone: {size} bytes needed, {free} bytes available; no audio file created"
+        );
         self.write_bounded("write_audio_new", path, input, size, MAX_AUDIO)
             .await
     }
@@ -1242,10 +1265,7 @@ impl Transfer {
         output: &mut impl std::io::Write,
         raw_reply: bool,
     ) -> Result<ObservedRead> {
-        ensure!(
-            expected <= cap && cap <= MAX_CATALOG,
-            "invalid read size/cap"
-        );
+        ensure!(expected <= cap && cap <= MAX_AUDIO, "invalid read size/cap");
         if self.readonly_summary {
             if self.current_summary {
                 ensure!(
@@ -2105,11 +2125,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audio_over_32_mib_streams_with_a_separate_64_mib_cap() {
+    async fn audio_over_64_mib_streams_without_relaxing_metadata_limits() {
         let trace = Temporary::new();
         let (mut transfer, mut peer) = pair(&trace.0, Duration::from_secs(20));
         transfer.unlock_writes();
-        let size = MAX_ASSET + 1;
+        let size = 64 * 1024 * 1024 + 1;
         assert!(
             transfer
                 .write_new("Airlock/Media/123.m4a", &mut std::io::empty(), size)
@@ -2128,6 +2148,15 @@ mod tests {
         );
         assert_eq!(transfer.sequence, 0);
         let server = tokio::spawn(async move {
+            let req = request(&mut peer, AfcOpcode::GetDevInfo).await;
+            reply(
+                &mut peer,
+                &req,
+                AfcOpcode::Data,
+                Vec::new(),
+                b"FSFreeBytes\x001099511627776\x00".to_vec(),
+            )
+            .await;
             open_fresh(&mut peer).await;
             let mut remaining = size;
             let mut digest = Sha256::new();
@@ -2158,6 +2187,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hash, server.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn insufficient_audio_space_refuses_before_creating_a_file() {
+        let trace = Temporary::new();
+        let (mut transfer, mut peer) = pair(&trace.0, Duration::from_secs(20));
+        transfer.unlock_writes();
+        let server = tokio::spawn(async move {
+            let req = request(&mut peer, AfcOpcode::GetDevInfo).await;
+            reply(
+                &mut peer,
+                &req,
+                AfcOpcode::Data,
+                Vec::new(),
+                b"FSFreeBytes\x00100\x00".to_vec(),
+            )
+            .await;
+        });
+        let error = transfer
+            .write_audio_new("Airlock/Media/large.mp3", &mut std::io::empty(), 101)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Not enough free space"));
+        assert_eq!(transfer.sequence, 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]

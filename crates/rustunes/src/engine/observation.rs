@@ -2,6 +2,10 @@
 use std::path::Path;
 
 pub enum Observation<'a> {
+    PreparingTransferAssets {
+        done: usize,
+        total: usize,
+    },
     /// A capture is copying the phone's Music catalogue.
     CapturingCatalogue,
     RevalidatingSources {

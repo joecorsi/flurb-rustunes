@@ -1008,8 +1008,9 @@ fn mp3_row(
         .values()
         .filter(|t| t.file_bytes == f.file_bytes && hex(&t.full_file_sha256) == f.full_file_sha256)
         .collect();
-    let fresh =
-        music_protocol::media::mpeg::read(&sources.base_directory.join(&source.relative_path));
+    let fresh = crate::engine::planning::source_reads::mpeg(
+        &sources.base_directory.join(&source.relative_path),
+    );
     let revalidated = fresh.as_ref().is_ok_and(|s| s == &source.source);
     let duplicate = sources
         .mp3_tracks
@@ -1579,7 +1580,7 @@ pub(crate) fn uninsertable_sources(sources: &SourceCollection) -> Vec<(String, S
             > 1;
         let refusal = unconvertible(sources, &source.source)
             .or_else(|| {
-                music_protocol::media::mpeg::read(&path)
+                crate::engine::planning::source_reads::mpeg(&path)
                     .and_then(|fresh| {
                         ensure!(
                             fresh == source.source,
@@ -2001,7 +2002,7 @@ fn plan_add(
 ) -> Result<Decision> {
     candidate_path(&candidate.path, folders, paths)?;
     ensure!(
-        source.fingerprint.file_bytes <= 64 * 1024 * 1024,
+        source.fingerprint.file_bytes <= music_protocol::protocol::transfer::MAX_AUDIO,
         "source exceeds production audio-transfer cap"
     );
     let planned = planner.plan(&source.metadata, candidate.ids)?;

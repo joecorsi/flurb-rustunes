@@ -162,7 +162,6 @@ pub fn write(
     Ok(())
 }
 
-
 fn count(value: &Value) -> String {
     let digits = value.as_i64().unwrap_or(0).to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -182,7 +181,10 @@ fn short_label(value: &str, width: usize) -> String {
     if safe.chars().count() <= width {
         safe
     } else {
-        safe.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+        safe.chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>()
+            + "…"
     }
 }
 
@@ -220,10 +222,12 @@ pub fn write_playlists(
 
 fn write_playlist_inventory(report: &Value, out: &mut impl Write) -> Result<()> {
     let all = report["playlists"].as_array().cloned().unwrap_or_default();
-    let active: Vec<_> = all.iter()
+    let active: Vec<_> = all
+        .iter()
         .filter(|p| !system_container(p) && p["music_members"].as_i64().unwrap_or(0) > 0)
         .collect();
-    let unmatched: Vec<_> = all.iter()
+    let unmatched: Vec<_> = all
+        .iter()
         .filter(|p| !system_container(p) && p["music_members"].as_i64().unwrap_or(0) == 0)
         .collect();
     let system: Vec<_> = all.iter().filter(|p| system_container(p)).collect();
@@ -252,8 +256,16 @@ fn write_playlist_inventory(report: &Value, out: &mut impl Write) -> Result<()> 
     }
 
     if !unmatched.is_empty() {
-        writeln!(out, "\nPLAYLISTS WITH NO MATCHED MUSIC  ({})", unmatched.len())?;
-        writeln!(out, "  {:<28} {:>9} {:>11}", "Name", "Entries", "Unresolved")?;
+        writeln!(
+            out,
+            "\nPLAYLISTS WITH NO MATCHED MUSIC  ({})",
+            unmatched.len()
+        )?;
+        writeln!(
+            out,
+            "  {:<28} {:>9} {:>11}",
+            "Name", "Entries", "Unresolved"
+        )?;
         writeln!(out, "  {}", "─".repeat(50))?;
         for p in &unmatched {
             writeln!(
@@ -268,7 +280,11 @@ fn write_playlist_inventory(report: &Value, out: &mut impl Write) -> Result<()> 
 
     if !system.is_empty() {
         writeln!(out, "\nBUILT-IN / LIBRARY CONTAINERS  ({})", system.len())?;
-        writeln!(out, "  {:<28} {:>9} {:>11}", "Name", "Entries", "Unresolved")?;
+        writeln!(
+            out,
+            "  {:<28} {:>9} {:>11}",
+            "Name", "Entries", "Unresolved"
+        )?;
         writeln!(out, "  {}", "─".repeat(50))?;
         for p in &system {
             writeln!(
@@ -338,8 +354,12 @@ fn write_favorites_comparison(report: &Value, out: &mut impl Write) -> Result<()
             }
         }
     }
-    let unresolved = comparison["playlist_unmatched_members"].as_u64().unwrap_or(0);
-    let duplicated = comparison["duplicate_membership_rows"].as_u64().unwrap_or(0);
+    let unresolved = comparison["playlist_unmatched_members"]
+        .as_u64()
+        .unwrap_or(0);
+    let duplicated = comparison["duplicate_membership_rows"]
+        .as_u64()
+        .unwrap_or(0);
     if unresolved != 0 || duplicated != 0 {
         writeln!(
             out,
@@ -353,17 +373,23 @@ fn write_catalog_notes(report: &Value, out: &mut impl Write) -> Result<()> {
     let Some(warnings) = report["warnings"].as_array() else {
         return Ok(());
     };
-    let amount = |code: &str| warnings.iter()
-        .find(|warning| warning["code"] == code)
-        .and_then(|warning| warning["count"].as_i64())
-        .unwrap_or(0);
+    let amount = |code: &str| {
+        warnings
+            .iter()
+            .find(|warning| warning["code"] == code)
+            .and_then(|warning| warning["count"].as_i64())
+            .unwrap_or(0)
+    };
     let albums = amount("albums_without_artist");
     let tracks = amount("tracks_in_albums_without_artist");
-    let other: Vec<_> = warnings.iter()
-        .filter(|warning| !matches!(
-            warning["code"].as_str(),
-            Some("albums_without_artist" | "tracks_in_albums_without_artist")
-        ))
+    let other: Vec<_> = warnings
+        .iter()
+        .filter(|warning| {
+            !matches!(
+                warning["code"].as_str(),
+                Some("albums_without_artist" | "tracks_in_albums_without_artist")
+            )
+        })
         .collect();
     if albums == 0 && other.is_empty() {
         return Ok(());
@@ -390,7 +416,6 @@ fn write_catalog_notes(report: &Value, out: &mut impl Write) -> Result<()> {
     }
     Ok(())
 }
-
 
 fn matches(track: &Track, filter: &Filter) -> bool {
     let m = &track.metadata;

@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use sha2::Digest;
 
 use crate::{
     engine::execution::apply,
@@ -227,7 +228,7 @@ pub(crate) async fn run_with(
         .collect();
     let planning_engine = engine.clone();
     let ready = tokio::task::spawn_blocking(move || {
-        let report = planning_engine.plan(PlanRequest {
+        let mut report = planning_engine.plan(PlanRequest {
             source: &source,
             snapshot: &saved_path,
             journal: journal_option.as_deref(),
@@ -242,24 +243,32 @@ pub(crate) async fn run_with(
         // matches must go first, and the sync plan again without it.
         let preserved = &report.plan.preserved_unmatched_device_tracks;
         if left.iter().any(|track| !preserved.contains(track)) {
-            return Ok::<_, anyhow::Error>((None, Vec::new(), skipped, true));
+            return Ok::<_, anyhow::Error>((None, Vec::new(), skipped, true, None));
         }
         if let Some(pinned) = &pinned {
             pinned.check_sync(&report.plan)?;
         }
         if report.ready() {
-            return Ok((
-                None,
-                metadata_batch::source_updates(&report.plan)?,
-                skipped,
-                false,
-            ));
+            let updates = metadata_batch::source_updates(&report.plan)?;
+            let retained = report
+                .retained
+                .take()
+                .context("sync planner did not retain its inspected inputs")?;
+            let checked = saved_plan::Validated {
+                plan: report.plan,
+                plan_sha256: sha2::Sha256::digest(&report.serialized).into(),
+                sources: retained.sources,
+                snapshot: retained.snapshot,
+                identity: retained.identity,
+                journal: retained.journal,
+            };
+            return Ok((None, updates, skipped, false, Some(checked)));
         }
-        Ok((Some(holds(&report.plan)), Vec::new(), skipped, false))
+        Ok((Some(holds(&report.plan)), Vec::new(), skipped, false, None))
     })
     .await
     .context("planning task failed")??;
-    let (held, updates, mut skipped, remove_first) = ready;
+    let (held, updates, mut skipped, remove_first, checked) = ready;
     let descriptor = serde_json::json!({"schema":"rustunes.run", "snapshot":snapshot_path,
         "journal":journal,"plan":plan,"dry_run":options.dry_run});
     private_write(
@@ -326,8 +335,13 @@ pub(crate) async fn run_with(
         engine.emit(Event::SyncFinished(&result))?;
         return Ok(result);
     }
-    // Retain exact source expectations before the audio phase changes the journal.
-    let checked = saved_plan::load_sync_expectations(&plan, &snapshot_path, &journal)?;
+    // These are the exact in-memory inputs that produced this run's plan.
+    // Loading a plan from disk still reconstructs it independently; ordinary
+    // sync does not reload and re-inspect its own freshly prepared input.
+    let mut checked = checked.context("ready sync lacks retained planning inputs")?;
+    if journal.try_exists()? {
+        checked.journal = Some(Journal::open_read_only(&journal, &checked.identity)?);
+    }
     // With a batch size of one, only MP3s are batched (one per batch).
     let mut batched = Some(insert_batch::members(&checked, options.batch_size)?)
         .filter(|b| !b.members.is_empty());

@@ -4,16 +4,14 @@ use std::{fs, path::PathBuf, time::UNIX_EPOCH};
 
 mod pins;
 
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "mpeg-preparation-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
@@ -134,14 +132,8 @@ fn an_mp3_goes_by_batch_with_apples_timing_and_no_authority() {
 }
 
 #[test]
-fn metadata_is_not_silently_truncated_normalized_or_relabelled() {
-    for (id, value) in [
-        ("TIT2", "second title"),
-        ("TDRC", "24-05-01"),
-        ("TCON", "(17)"),
-        ("TRCK", "0/2"),
-        ("TPOS", "3/2"),
-    ] {
+fn ambiguous_required_text_is_refused_and_optional_sync_conventions_are_explicit() {
+    for (id, value) in [("TIT2", "second title"), ("TCON", "(9999)")] {
         let temp = Temp::new();
         let mut values = tags();
         values.push((id, value));
@@ -188,10 +180,11 @@ fn an_mp3_with_two_composers_is_refused_with_the_tag_to_edit() {
 }
 
 #[test]
-fn missing_title_and_unknown_frame_are_actionable_blockers() {
+fn missing_title_uses_filename_and_unknown_frame_stays_explicit() {
     let temp = Temp::new();
     let (_, source) = temp.source(&[("TPE1", "Artist"), ("TALB", "Album")], audio());
-    assert!(assess(&source).metadata.is_none());
+    assert!(source.metadata.title.is_empty());
+    assert_eq!(assess(&source).metadata.unwrap().title, "source");
     let mut values = tags();
     values.push(("TIT3", "a subtitle"));
     let (path, source) = temp.source(&values, audio());
@@ -532,22 +525,21 @@ fn pure_serializer_rejects_bad_format_ids_text_anchor_and_duration() {
 }
 
 #[test]
-fn complete_over_transfer_cap_source_is_inspectable_but_cannot_prepare() {
+fn complete_mix_over_64_mib_can_prepare() {
     let temp = Temp::new();
     let mut frame = vec![0u8; 417];
     frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
-    let frames = (music_protocol::protocol::transfer::MAX_AUDIO / 417 + 1) as usize;
+    let frames = (64 * 1024 * 1024 / 417 + 1) as usize;
     let (path, source) = temp.source(&tags(), frame.repeat(frames));
-    assert!(source.fingerprint.file_bytes > music_protocol::protocol::transfer::MAX_AUDIO);
+    assert!(source.fingerprint.file_bytes > 64 * 1024 * 1024);
     let assessment = assess(&source);
     assert!(
-        assessment
+        !assessment
             .compatibility_issues
             .iter()
             .any(|i| i.code == "mp3_native_transfer_size_limit")
     );
-    let refusal = PreparedSource::read_expected(&path, &source).err().unwrap();
-    assert!(refusal.to_string().contains("64 MiB"));
+    PreparedSource::read_expected(&path, &source).unwrap();
     assert!(!assessment.execution_authorized);
 }
 

@@ -35,6 +35,7 @@ enum Pin {
     Json(&'static str),
     /// The step refuses this fixture.
     Refused,
+    Accepted,
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -52,6 +53,7 @@ fn shown(bytes: &[u8]) -> String {
 
 fn check<T: AsRef<[u8]>>(result: Result<T>, pin: Pin) {
     match (pin, result) {
+        (Pin::Accepted, Ok(_)) => {}
         (Pin::Refused, result) => {
             let accepted = result.ok().map(|output| shown(output.as_ref()));
             assert!(accepted.is_none(), "now accepted: {}", accepted.unwrap());
@@ -343,7 +345,7 @@ mod fixtures {
     pub(super) fn oversize_mp3() -> Fixture {
         let mut frame = vec![0u8; 417];
         frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
-        let frames = (music_protocol::protocol::transfer::MAX_AUDIO / 417 + 1) as usize;
+        let frames = (64 * 1024 * 1024 / 417 + 1) as usize;
         Fixture::tagged(&tags(), frame.repeat(frames))
     }
     pub(super) fn forged_without_apple_timing_mp3() -> Fixture {
@@ -457,18 +459,18 @@ pins!(assessment, assessment, {
     aiff => Pin::Hash("2deda8b669581266da101874ef24bf76e9c88abb84fc197f02e8346c2e3213c1"),
     mpeg2_mp3 => Pin::Hash("ace06e142a49d076ccad6a1a18c501ded8f2fb3a99a8820577ecf070752cb98c"),
     vbr_mpeg1_mp3 => Pin::Hash("1198f79e3683d62a46c0849b72ad23d3270c7ba2bb30fd71bf724e9a9b35a83a"),
-    compilation_without_album_artist_mp3 => Pin::Hash("2481e0f1aed6f1fc896f5b8b40d3bef8f13f1ddaec8b3be53904baf87caba212"),
+    compilation_without_album_artist_mp3 => Pin::Hash("f8c589e9dc477b06ca2a9d2efa7c4424c91a0e815a0f8a3a5b67ccc2f6552da9"),
     back_cover_mp3 => Pin::Hash("71c450e77516c02a29200804314e6e93db81fab6b5ae42ca7f26ed47307df27b"),
-    missing_title_mp3 => Pin::Hash("8b9e00ea33c5403a5031f8d88ed70c18068e278860dcfb623e05d56f1ee53cf4"),
+    missing_title_mp3 => Pin::Hash("c349afd8b461d89e10f6e8aa316f60e98f50de9f09f875df0c56294d9d2711a0"),
     second_title_mp3 => Pin::Hash("4a5616f9d8c94677ec423ef2761092c824e512aeb7bccd7a44518203e967034f"),
     second_artist_empty_mp3 => Pin::Hash("54f678d7bf091bed2030d6eed35e1320659416fe27ef6e7a3c8f70b9c9f41797"),
-    empty_album_mp3 => Pin::Hash("e6c1406155593dad645dc55a175b5694bdf31eaf77b42235add7103b77d47b42"),
-    bad_release_date_mp3 => Pin::Hash("7bc415e07e4cff51df9a1496a2bdb09f7a60a73d67a0896eb6fd2383bf7569b5"),
-    zero_release_year_mp3 => Pin::Hash("f5ac590ae96a26983451bf9412617bf576fdf0ed6c5ee9dc06cef33d2d604962"),
-    numeric_genre_mp3 => Pin::Hash("89cb2ef65d537f11b35d3bb1034700da7d3afc1165ac553d98e07a5d64b6e832"),
-    zero_track_mp3 => Pin::Hash("c55ace98af69f6c2a0df97766f1c556b094f65406d3e74cccb58780b11c97218"),
-    disc_exceeds_total_mp3 => Pin::Hash("5bc68bb4dcc72a39c6da2faa93f4da5f59748d602eb28c5d17472d76ac07467e"),
-    oversize_mp3 => Pin::Hash("ac403d801e8b2592ce5aa4e617308c03eead11b80df5ddd23f8fc50a565b4645"),
+    empty_album_mp3 => Pin::Hash("212f1ca542262feeae8ca944b94f12c69528116dc86d41aa1fe8b5a5d5ddd0a3"),
+    bad_release_date_mp3 => Pin::Hash("3bbc9c328952f8356a586b8261617315f51ad0b58782fdd98f32739461c6d0f8"),
+    zero_release_year_mp3 => Pin::Hash("1f19e0d4b2977f5fd62c89d3799915b82180dd3fa3922703954f18dcbbc28f70"),
+    numeric_genre_mp3 => Pin::Hash("cd53e361493cfa6b41ad75274057d7ab145fde2d52e164de6a0c6a02c3d4270b"),
+    zero_track_mp3 => Pin::Hash("50954c790a0b8b58ec496752c1b7001255d5031a8c45b87c5a58adc2bb73bac4"),
+    disc_exceeds_total_mp3 => Pin::Hash("a88ec0a162d53478dae1098da75afa193b931f78c1429ad7a65b6897509a4f0e"),
+    oversize_mp3 => Pin::Hash("9aec3931f187b5754898226897a8a0e2e4ecd1f2af51ba63fc675f18ae1f769f"),
     forged_without_apple_timing_mp3 => Pin::Hash("453db7bd9d846cb643a25b4e75897c6e242863ab255fda3b1af42e0a471a8910"),
     forged_wav_at_12_bits => Pin::Hash("b8dcde7209e5b103f8f5f286be6b50b9c9bd03d5e55371337c90044e2e64faf2"),
     forged_flac_disagreeing_with_its_identity => Pin::Hash("b12e0af12190f5afea4aafa88b8ff0491c3b14e2953aa87a9b04ab7c8cd7d5fb"),
@@ -484,16 +486,16 @@ pins!(issues, issues, {
     aac_m4a => Pin::Json(r#"[{"code":"mp3_other_format_batch_only","detail":"AAC-LC goes only in an insert batch"},{"code":"mp3_extended_metadata_mapping_required","detail":"Additional tags are projected without loss; they go only in an insert batch"}]"#),
     mpeg2_mp3 => Pin::Json(r#"[{"code":"mp3_other_format_batch_only","detail":"MPEG-2 Layer III goes only in an insert batch"},{"code":"mp3_extended_metadata_mapping_required","detail":"Additional tags are projected without loss; they go only in an insert batch"}]"#),
     compilation_without_album_artist_mp3 => Pin::Json(r#"[{"code":"mp3_extended_metadata_mapping_required","detail":"Additional tags are projected without loss; they go only in an insert batch"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    missing_title_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"missing title"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    missing_title_mp3 => Pin::Json(r#"[{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
     second_title_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"title has 2 values in the file's tag; edit the tag to keep one"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
     second_artist_empty_mp3 => Pin::Json(r#"[{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    empty_album_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"missing album"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    bad_release_date_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"a release date must start with a four-digit year"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    zero_release_year_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"zero release year"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    numeric_genre_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"numeric ID3 genres require an explicit label mapping"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    zero_track_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"zero track numbering"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    disc_exceeds_total_mp3 => Pin::Json(r#"[{"code":"mp3_metadata_policy_required","detail":"disc number exceeds total"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
-    oversize_mp3 => Pin::Json(r#"[{"code":"mp3_native_transfer_size_limit","detail":"Source has 67109169 bytes; the existing native audio transfer limit is 67108864 bytes (64 MiB)"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    empty_album_mp3 => Pin::Json(r#"[{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    bad_release_date_mp3 => Pin::Json(r#"[{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    zero_release_year_mp3 => Pin::Json(r#"[{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    numeric_genre_mp3 => Pin::Json(r#"[{"code":"mp3_extended_metadata_mapping_required","detail":"Additional tags are projected without loss; they go only in an insert batch"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    zero_track_mp3 => Pin::Json(r#"[{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    disc_exceeds_total_mp3 => Pin::Json(r#"[{"code":"mp3_extended_metadata_mapping_required","detail":"Additional tags are projected without loss; they go only in an insert batch"},{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
+    oversize_mp3 => Pin::Json(r#"[{"code":"mp3_gapless_batch_only","detail":"The encoder delay, drain and played duration Apple's sync finds for an MP3 go only in an insert batch"}]"#),
     forged_without_apple_timing_mp3 => Pin::Json(r#"[{"code":"mp3_timing_policy_required","detail":"Apple's MPEG timing unavailable"}]"#),
     forged_wav_at_12_bits => Pin::Json(r#"[{"code":"mp3_other_format_batch_only","detail":"WAV (PCM) goes only in an insert batch"},{"code":"mp3_extended_metadata_mapping_required","detail":"Additional tags are projected without loss; they go only in an insert batch"},{"code":"mp3_timing_policy_required","detail":"the phone plays WAV (PCM) at 8, 16 or 24 bits; this is 12-bit"}]"#),
     forged_flac_disagreeing_with_its_identity => Pin::Json(r#"[{"code":"mp3_other_format_batch_only","detail":"FLAC goes only in an insert batch"},{"code":"mp3_extended_metadata_mapping_required","detail":"Additional tags are projected without loss; they go only in an insert batch"},{"code":"mp3_timing_policy_required","detail":"audio report and identity differ"}]"#),
@@ -522,17 +524,17 @@ pins!(operation, operation, {
     aiff => Pin::Hash("f784665b8d00efe977b49305692518ad71a8d8b2ece5729aa678b28ffd19bdac"),
     mpeg2_mp3 => Pin::Hash("a1bb23d78000e9805c96b7088df908da70427f4766ed87335cd76b80f11c25a6"),
     vbr_mpeg1_mp3 => Pin::Hash("8bf56633ce647e654897446406c21fa1287255eb0eea603da5d4327bff9035c6"),
-    compilation_without_album_artist_mp3 => Pin::Refused,
+    compilation_without_album_artist_mp3 => Pin::Hash("19f0cd95e43a30eeead5651405bc081ff4738ba8fbae11d8f4184ae793e05bfe"),
     back_cover_mp3 => Pin::Hash("f0e58f51e84c4e4773446169b2a71c1a35b283a4f0c99006530ba2d5dbd046df"),
-    missing_title_mp3 => Pin::Refused,
+    missing_title_mp3 => Pin::Hash("131b174a964fd23e3856d36f70a97e4b694d0dc77109c4c3f468beaa17f6bcb0"),
     second_title_mp3 => Pin::Refused,
     second_artist_empty_mp3 => Pin::Hash("f0e58f51e84c4e4773446169b2a71c1a35b283a4f0c99006530ba2d5dbd046df"),
-    empty_album_mp3 => Pin::Refused,
-    bad_release_date_mp3 => Pin::Refused,
-    zero_release_year_mp3 => Pin::Refused,
-    numeric_genre_mp3 => Pin::Refused,
-    zero_track_mp3 => Pin::Refused,
-    disc_exceeds_total_mp3 => Pin::Refused,
+    empty_album_mp3 => Pin::Hash("0bd3eba2f0c3818114667c7472a24ce280b9c0baf6f187e1528a88aa6a994bb4"),
+    bad_release_date_mp3 => Pin::Accepted,
+    zero_release_year_mp3 => Pin::Accepted,
+    numeric_genre_mp3 => Pin::Hash("464f198deeabb19606f68bd83149fef259c8565e68c914e3867a60cc6632d7e6"),
+    zero_track_mp3 => Pin::Accepted,
+    disc_exceeds_total_mp3 => Pin::Accepted,
 });
 
 pins!(operation_joined, operation_joined, {
@@ -570,17 +572,17 @@ pins!(fields, fields, {
     aiff => Pin::Hash("653565b598752e26d8d60db80b51f8f1aa89168d07aeb8705d5f69a603d0f924"),
     mpeg2_mp3 => Pin::Hash("1b21775ecc75b6f4c94bc3722c87e40989f0d9721b3c009e685a9d6747c40e84"),
     vbr_mpeg1_mp3 => Pin::Hash("0d62b140ce82bbfb5337852877d5673832b4ba6a62c172d6078b1c5dd7f21b4f"),
-    compilation_without_album_artist_mp3 => Pin::Refused,
+    compilation_without_album_artist_mp3 => Pin::Hash("27d0b33368bbdfa7168f962606f5837f69d293e5d260076ff6055ce121d0599d"),
     back_cover_mp3 => Pin::Hash("04afb48d6678d575eb7498ea56f25f6979425ce8566c04bb476ebc8e315b86f7"),
-    missing_title_mp3 => Pin::Refused,
+    missing_title_mp3 => Pin::Json(r#"[{"title":"source","artist":"Artist","album":"Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"compilation":null},{"basis":"apple_counted_frames_and_played_samples","sample_rate":44100,"channels":2,"bit_rate_kbps":128,"coded_samples":1176,"total_time_ms_floor":52,"native_mapping_qualified":false,"gapless":{"delay":528,"drain":600,"heuristic":33554435,"resynch":0}}]"#),
     second_title_mp3 => Pin::Refused,
     second_artist_empty_mp3 => Pin::Hash("04afb48d6678d575eb7498ea56f25f6979425ce8566c04bb476ebc8e315b86f7"),
-    empty_album_mp3 => Pin::Refused,
-    bad_release_date_mp3 => Pin::Refused,
-    zero_release_year_mp3 => Pin::Refused,
-    numeric_genre_mp3 => Pin::Refused,
-    zero_track_mp3 => Pin::Refused,
-    disc_exceeds_total_mp3 => Pin::Refused,
+    empty_album_mp3 => Pin::Hash("f20709353565f5309c5876d6cc8a291d41d6d57a87ea9ed5c0b62df5e2b4fdb6"),
+    bad_release_date_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"compilation":null},{"basis":"apple_counted_frames_and_played_samples","sample_rate":44100,"channels":2,"bit_rate_kbps":128,"coded_samples":1176,"total_time_ms_floor":52,"native_mapping_qualified":false,"gapless":{"delay":528,"drain":600,"heuristic":33554435,"resynch":0}}]"#),
+    zero_release_year_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"compilation":null},{"basis":"apple_counted_frames_and_played_samples","sample_rate":44100,"channels":2,"bit_rate_kbps":128,"coded_samples":1176,"total_time_ms_floor":52,"native_mapping_qualified":false,"gapless":{"delay":528,"drain":600,"heuristic":33554435,"resynch":0}}]"#),
+    numeric_genre_mp3 => Pin::Hash("17b0651ecd4ecf72c0bebbf212cc650044b7a063584e4865dad529c890f0084a"),
+    zero_track_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"compilation":null},{"basis":"apple_counted_frames_and_played_samples","sample_rate":44100,"channels":2,"bit_rate_kbps":128,"coded_samples":1176,"total_time_ms_floor":52,"native_mapping_qualified":false,"gapless":{"delay":528,"drain":600,"heuristic":33554435,"resynch":0}}]"#),
+    disc_exceeds_total_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"track":null,"track_total":null,"disc":3,"disc_total":null,"compilation":null},{"basis":"apple_counted_frames_and_played_samples","sample_rate":44100,"channels":2,"bit_rate_kbps":128,"coded_samples":1176,"total_time_ms_floor":52,"native_mapping_qualified":false,"gapless":{"delay":528,"drain":600,"heuristic":33554435,"resynch":0}}]"#),
 });
 
 pins!(expected, expected, {
@@ -606,17 +608,17 @@ pins!(expected, expected, {
     aiff => Pin::Hash("ad0755b0186599ab98375091fccdffe1cbc4931ffad79ad1ebdc8858e0153ad1"),
     mpeg2_mp3 => Pin::Hash("2d9d3948a51d2559caaba1fdbf0b0e290fd05f4950ebcff27c2a11264459adf8"),
     vbr_mpeg1_mp3 => Pin::Hash("5a1a3b543114bda2fb07815e660022f1de8490dbf4ccef86247a442fa7a21f4a"),
-    compilation_without_album_artist_mp3 => Pin::Refused,
+    compilation_without_album_artist_mp3 => Pin::Hash("6a179ce989dba9abdd1b9eae49c7c944d8d7d4160afb457275d4128ed7de8ede"),
     back_cover_mp3 => Pin::Hash("65b79660777d755bbf5127c47260394430104d0a93e95e5702f61b11c303332f"),
-    missing_title_mp3 => Pin::Refused,
+    missing_title_mp3 => Pin::Json(r#"[{"title":"source","artist":"Artist","album":"Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null},52]"#),
     second_title_mp3 => Pin::Refused,
     second_artist_empty_mp3 => Pin::Hash("65b79660777d755bbf5127c47260394430104d0a93e95e5702f61b11c303332f"),
-    empty_album_mp3 => Pin::Refused,
-    bad_release_date_mp3 => Pin::Refused,
-    zero_release_year_mp3 => Pin::Refused,
-    numeric_genre_mp3 => Pin::Refused,
-    zero_track_mp3 => Pin::Refused,
-    disc_exceeds_total_mp3 => Pin::Refused,
+    empty_album_mp3 => Pin::Hash("088032c90ebd97133071a5f7f9e61f97b1ef0a4cc0ed23044e6387c3ae533063"),
+    bad_release_date_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null},52]"#),
+    zero_release_year_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null},52]"#),
+    numeric_genre_mp3 => Pin::Hash("12d2d3acd41864ed52ba436a1d0011ffda8eeffe782425b4abb2432490448fb2"),
+    zero_track_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null},52]"#),
+    disc_exceeds_total_mp3 => Pin::Json(r#"[{"title":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":3,"disc_total":null},52]"#),
 });
 
 pins!(projected, projected, {
@@ -642,15 +644,15 @@ pins!(projected, projected, {
     aiff => Pin::Hash("0f6879e9d2cfce695a27741ae53db7822ff82e09ec69a0010caf1d33b7694f84"),
     mpeg2_mp3 => Pin::Hash("70e49183e0673c57fd4e39c15416f07e012fdeef6b88b4728ba118eefb860b1e"),
     vbr_mpeg1_mp3 => Pin::Hash("30ed61598bd3b6da5fe90d97d3ed72fb15c2aa286beb59d6d27149c4b3e9fff4"),
-    compilation_without_album_artist_mp3 => Pin::Refused,
+    compilation_without_album_artist_mp3 => Pin::Hash("3d147a96213adfe1dbc31ec474fb90315760655c86c3847691967e9e280de858"),
     back_cover_mp3 => Pin::Json(r#"{"title":"Independent Song","sort_name":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"grouping_artist":"Source Artist","genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"sample_rate":44100,"bit_depth":0,"channels":2,"duration_ticks":1176,"total_time_ms":52}"#),
-    missing_title_mp3 => Pin::Refused,
+    missing_title_mp3 => Pin::Json(r#"{"title":"source","sort_name":"source","artist":"Artist","album":"Album","album_artist":null,"grouping_artist":"Artist","genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"sample_rate":44100,"bit_depth":0,"channels":2,"duration_ticks":1176,"total_time_ms":52}"#),
     second_title_mp3 => Pin::Refused,
     second_artist_empty_mp3 => Pin::Hash("2469aca3efc8a6fa164c2a0312bef50ee51565ce0f6b6aa8a55e12a6111c354a"),
-    empty_album_mp3 => Pin::Refused,
-    bad_release_date_mp3 => Pin::Refused,
-    zero_release_year_mp3 => Pin::Refused,
-    numeric_genre_mp3 => Pin::Refused,
-    zero_track_mp3 => Pin::Refused,
-    disc_exceeds_total_mp3 => Pin::Refused,
+    empty_album_mp3 => Pin::Hash("ae1d592dd8ed8570fda3b32d0f8a9de82e0a0b53d8b0f1d576935a1247422d52"),
+    bad_release_date_mp3 => Pin::Json(r#"{"title":"Independent Song","sort_name":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"grouping_artist":"Source Artist","genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"sample_rate":44100,"bit_depth":0,"channels":2,"duration_ticks":1176,"total_time_ms":52}"#),
+    zero_release_year_mp3 => Pin::Json(r#"{"title":"Independent Song","sort_name":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"grouping_artist":"Source Artist","genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"sample_rate":44100,"bit_depth":0,"channels":2,"duration_ticks":1176,"total_time_ms":52}"#),
+    numeric_genre_mp3 => Pin::Hash("7f026ff242a990e05f3b3ff0a4a67ac20ca5e73723765309615938f5cebe46a9"),
+    zero_track_mp3 => Pin::Json(r#"{"title":"Independent Song","sort_name":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"grouping_artist":"Source Artist","genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":null,"disc_total":null,"sample_rate":44100,"bit_depth":0,"channels":2,"duration_ticks":1176,"total_time_ms":52}"#),
+    disc_exceeds_total_mp3 => Pin::Json(r#"{"title":"Independent Song","sort_name":"Independent Song","artist":"Source Artist","album":"Source Album","album_artist":null,"grouping_artist":"Source Artist","genre":null,"composer":null,"copyright":null,"year":null,"content_rating":null,"compilation":null,"track":null,"track_total":null,"disc":3,"disc_total":null,"sample_rate":44100,"bit_depth":0,"channels":2,"duration_ticks":1176,"total_time_ms":52}"#),
 });

@@ -24,8 +24,13 @@ use crate::engine::{
         native_insert::{Control, create_trace, durable_write},
         removal_batch::{self, Before, Requests, Sent},
     },
-    state::{journal::{Binding, Identity, Journal}, layout},
+    state::{
+        journal::{Binding, Identity, Journal},
+        layout,
+    },
 };
+
+pub(super) mod managed;
 
 pub(super) struct Options<'a> {
     pub(super) playlist: &'a Path,
@@ -55,7 +60,10 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 fn sha_file(path: &Path) -> Result<String> {
-    ensure!(fs::metadata(path)?.len() <= 64 * 1024 * 1024, "source exceeds 64 MiB fixture limit");
+    ensure!(
+        fs::metadata(path)?.len() <= 64 * 1024 * 1024,
+        "source exceeds 64 MiB fixture limit"
+    );
     let mut reader = File::open(path)?;
     let mut buf = [0u8; 65536];
     let mut hash = Sha256::new();
@@ -79,16 +87,25 @@ fn entries(text: &str) -> Result<Vec<PathBuf>> {
         }
         let path = PathBuf::from(line);
         ensure!(
-            path.components().all(|component| matches!(component, Component::Normal(_))),
+            path.components()
+                .all(|component| matches!(component, Component::Normal(_))),
             "playlist entry must be a relative path without parent traversal: {line}"
         );
-        ensure!(path.extension().and_then(|ext| ext.to_str()) == Some("mp3"),
-            "this first playlist trial accepts only MP3 entries");
-        ensure!(seen.insert(path.clone()), "duplicate playlist entry: {line}");
+        ensure!(
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp3")),
+            "this first playlist trial accepts only MP3 entries"
+        );
+        ensure!(
+            seen.insert(path.clone()),
+            "duplicate playlist entry: {line}"
+        );
         found.push(path);
     }
-    ensure!(!found.is_empty() && found.len() <= 499,
-        "a playlist must contain 1..=499 distinct MP3 tracks");
+    ensure!(
+        !found.is_empty() && found.len() <= 499,
+        "a playlist must contain 1..=499 distinct MP3 tracks"
+    );
     Ok(found)
 }
 
@@ -132,7 +149,11 @@ struct JournalMatches {
     bindings: Vec<Binding>,
 }
 
-fn journal_matches(state: &Path, before: &Before, identity: &Identity) -> Result<Option<JournalMatches>> {
+fn journal_matches(
+    state: &Path,
+    before: &Before,
+    identity: &Identity,
+) -> Result<Option<JournalMatches>> {
     let path = layout::journal_path(
         state,
         &before.snapshot.identity.device_identifier_sha256,
@@ -161,25 +182,39 @@ fn journal_track(
     before: &Before,
 ) -> Result<Option<(u64, &'static str)>> {
     let installed = &before.snapshot.index;
-    let in_catalog = |id| before.current.catalog.tracks().iter().any(|t| t.sync_id == id);
-    let bound: Vec<_> = journal.bindings.iter()
+    let in_catalog = |id| {
+        before
+            .current
+            .catalog
+            .tracks()
+            .iter()
+            .any(|t| t.sync_id == id)
+    };
+    let bound: Vec<_> = journal
+        .bindings
+        .iter()
         .filter(|b| {
             b.content.source.audio.sha256 == source.audio.sha256
                 && !b.content.source.is_alac()
                 && installed.other_audio().contains_key(&b.content.track_pid)
                 && in_catalog(b.content.track_pid)
                 && installed.matches_transferred_source(
-                    b.content.track_pid, &b.content.path, &b.content.source
+                    b.content.track_pid,
+                    &b.content.path,
+                    &b.content.source,
                 )
         })
         .collect();
-    let path_candidates: Vec<u64> = journal.sources.iter()
+    let path_candidates: Vec<u64> = journal
+        .sources
+        .iter()
         .filter(|(_, recorded)| recorded.as_path() == path)
         .map(|(id, _)| *id)
         .collect();
     ensure!(
         path_candidates.len() <= 1,
-        "multiple journal track IDs are recorded for {}", path.display()
+        "multiple journal track IDs are recorded for {}",
+        path.display()
     );
     if let Some(id) = path_candidates.first() {
         ensure!(
@@ -194,7 +229,9 @@ fn journal_track(
         "multiple active journal track IDs match the audio of {}; cannot choose a member",
         path.display()
     );
-    Ok(bound.first().map(|b| (b.content.track_pid, "journal-audio")))
+    Ok(bound
+        .first()
+        .map(|b| (b.content.track_pid, "journal-audio")))
 }
 
 /// Read each entry in M3U8 order. Prefer the exact active journal track ID;
@@ -220,6 +257,41 @@ fn resolve_members(
             "{} resolves outside the playlist folder",
             relative.display()
         );
+        if let Some(journal) = journal {
+            let hash =
+                crate::engine::planning::file_hashes::read(&path, &crate::engine::cancellation())?;
+            let candidates: Vec<_> = journal
+                .bindings
+                .iter()
+                .filter(|b| {
+                    b.content.source.full_file_sha256 == hash
+                        && before.snapshot.index.matches_transferred_source(
+                            b.content.track_pid,
+                            &b.content.path,
+                            &b.content.source,
+                        )
+                })
+                .collect();
+            if candidates.len() == 1 {
+                let b = candidates[0];
+                let id = b.content.track_pid;
+                ensure!(
+                    used.insert(id),
+                    "multiple playlist entries resolve to the same installed track"
+                );
+                ensure!(
+                    before
+                        .current
+                        .catalog
+                        .tracks()
+                        .iter()
+                        .any(|t| t.sync_id == id),
+                    "installed track has no catalogue registration"
+                );
+                members.push((id, hex(&b.content.source.full_file_sha256)));
+                continue;
+            }
+        }
         let source = music_protocol::media::mpeg::read(&path)
             .with_context(|| format!("inspecting playlist MP3 {}", relative.display()))?;
         ensure!(
@@ -245,8 +317,7 @@ fn resolve_members(
                     .iter()
                     .filter(|(_, audio)| {
                         audio.file_bytes == source.fingerprint.file_bytes
-                            && hex(&audio.full_file_sha256)
-                                == source.fingerprint.full_file_sha256
+                            && hex(&audio.full_file_sha256) == source.fingerprint.full_file_sha256
                             && same_mp3_codec(&source, &audio.codec)
                     })
                     .map(|(id, _)| *id)
@@ -254,12 +325,14 @@ fn resolve_members(
                 ensure!(
                     matches.len() == 1,
                     "{}: no verified journal track ID and {} exact on-device file matches. Push the missing audio first or resolve duplicates.",
-                    relative.display(), matches.len()
+                    relative.display(),
+                    matches.len()
                 );
                 (matches[0], "exact-file-fallback")
             }
         };
-        let phone = installed.get(&id)
+        let phone = installed
+            .get(&id)
             .with_context(|| format!("resolved track {id:016x} has no installed MP3 audio"))?;
         let file_sha = hex(&phone.full_file_sha256);
         println!(
@@ -267,7 +340,12 @@ fn resolve_members(
             relative.display()
         );
         ensure!(
-            before.current.catalog.tracks().iter().any(|track| track.sync_id == id),
+            before
+                .current
+                .catalog
+                .tracks()
+                .iter()
+                .any(|track| track.sync_id == id),
             "track {id:016x} has audio but no current catalogue registration"
         );
         ensure!(
@@ -284,17 +362,31 @@ fn qualify(before: &Before, name: &str, members: &[(u64, String)]) -> Result<()>
     for (row, multiplicity) in &containers.rows {
         ensure!(*multiplicity == 1, "duplicate existing container row");
         if let Ok(existing) = containers.at(row, "name")?.text() {
-            ensure!(!existing.eq_ignore_ascii_case(name),
-                "playlist already exists: {name}; refusing duplicate");
+            ensure!(
+                !existing.eq_ignore_ascii_case(name),
+                "playlist already exists: {name}; refusing duplicate"
+            );
         }
     }
     let index = &before.snapshot.index;
     for (id, sha) in members {
-        let found = index.other_audio().get(id)
+        let found = index
+            .other_audio()
+            .get(id)
             .with_context(|| format!("track {id:016x} is no longer installed as MP3"))?;
-        ensure!(hex(&found.full_file_sha256) == *sha, "phone track {id:016x} changed during matching");
-        ensure!(before.current.catalog.tracks().iter().any(|t| t.sync_id == *id),
-            "track {id:016x} is absent from current catalogue");
+        ensure!(
+            hex(&found.full_file_sha256) == *sha,
+            "phone track {id:016x} changed during matching"
+        );
+        ensure!(
+            before
+                .current
+                .catalog
+                .tracks()
+                .iter()
+                .any(|t| t.sync_id == *id),
+            "track {id:016x} is absent from current catalogue"
+        );
     }
     Ok(())
 }
@@ -302,11 +394,7 @@ fn qualify(before: &Before, name: &str, members: &[(u64, String)]) -> Result<()>
 /// A previous Started trial might have created its playlist even if the
 /// verification connection failed. Never queue a second creation on that
 /// device/library until the first result has been investigated.
-fn refuse_unsettled_trial(
-    trials: &Path,
-    device_sha: &str,
-    library_sha: &str,
-) -> Result<()> {
+fn refuse_unsettled_trial(trials: &Path, device_sha: &str, library_sha: &str) -> Result<()> {
     for entry in fs::read_dir(trials)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -342,8 +430,11 @@ fn fresh_pid(before: &Before) -> Result<u64> {
         {
             let containers = before.sql.table("container")?;
             if !containers.rows.keys().any(|row| {
-                containers.at(row, "container_pid")
-                    .and_then(|cell| cell.integer()).ok() == Some(pid as i64)
+                containers
+                    .at(row, "container_pid")
+                    .and_then(|cell| cell.integer())
+                    .ok()
+                    == Some(pid as i64)
             }) {
                 return Ok(pid);
             }
@@ -352,7 +443,13 @@ fn fresh_pid(before: &Before) -> Result<u64> {
     bail!("could not allocate an unused playlist identity")
 }
 
-fn verify(after: &Before, before: &Before, pid: u64, name: &str, members: &[(u64, String)]) -> Result<()> {
+fn verify(
+    after: &Before,
+    before: &Before,
+    pid: u64,
+    name: &str,
+    members: &[(u64, String)],
+) -> Result<()> {
     ensure!(
         before.snapshot.index.same_files(&after.snapshot.index),
         "the iPhone audio inventory changed during playlist creation"
@@ -367,9 +464,11 @@ fn verify(after: &Before, before: &Before, pid: u64, name: &str, members: &[(u64
     );
     let container = after.sql.table("container")?;
     let row = container.one("container_pid", pid as i64)?;
-    ensure!(container.at(row, "name")?.text()? == name
-        && container.at(row, "sync_id")?.integer()? == pid as i64,
-        "created playlist name or identity differs");
+    ensure!(
+        container.at(row, "name")?.text()? == name
+            && container.at(row, "sync_id")?.integer()? == pid as i64,
+        "created playlist name or identity differs"
+    );
 
     let member_table = after.sql.table("container_item")?;
     let mut observed = Vec::new();
@@ -383,17 +482,27 @@ fn verify(after: &Before, before: &Before, pid: u64, name: &str, members: &[(u64
         }
     }
     observed.sort_unstable();
-    let expected: Vec<_> = members.iter().enumerate()
+    let expected: Vec<_> = members
+        .iter()
+        .enumerate()
         .map(|(position, (id, _))| Ok((position as i64, before.item_pid(*id)?)))
         .collect::<Result<_>>()?;
-    ensure!(observed == expected, "playlist membership or ordering differs from M3U8");
+    ensure!(
+        observed == expected,
+        "playlist membership or ordering differs from M3U8"
+    );
     Ok(())
 }
 
 pub(super) async fn run(o: Options<'_>) -> Result<()> {
-    ensure!(!o.name.trim().is_empty() && o.name.len() <= 255
-        && !o.name.chars().any(char::is_control), "invalid playlist name");
-    ensure!(fs::metadata(o.playlist)?.len() <= 1024 * 1024, "M3U8 is too large");
+    ensure!(
+        !o.name.trim().is_empty() && o.name.len() <= 255 && !o.name.chars().any(char::is_control),
+        "invalid playlist name"
+    );
+    ensure!(
+        fs::metadata(o.playlist)?.len() <= 1024 * 1024,
+        "M3U8 is too large"
+    );
     let playlist_text = fs::read_to_string(o.playlist).context("reading playlist M3U8")?;
     let selected = entries(&playlist_text)?;
 
@@ -421,7 +530,11 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
         )?;
     }
     if o.dry_run {
-        println!("Playlist dry-run: {:?} → {} existing tracks, correct M3U8 order; 0 audio transfers", o.name, members.len());
+        println!(
+            "Playlist dry-run: {:?} → {} existing tracks, correct M3U8 order; 0 audio transfers",
+            o.name,
+            members.len()
+        );
         println!("No phone writes. Evidence: {}", root.display());
         return Ok(());
     }
@@ -448,8 +561,12 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
     }))?;
     durable_write(&root, "input.json", &input)?;
     durable_write(&root, "operation.plist", &operation)?;
-    let receipt: [u8;32] = Sha256::digest(&input).into();
-    println!("Creating playlist {:?} ({} already-installed tracks).",o.name,members.len());
+    let receipt: [u8; 32] = Sha256::digest(&input).into();
+    println!(
+        "Creating playlist {:?} ({} already-installed tracks).",
+        o.name,
+        members.len()
+    );
     let send = root.join("send");
     let operation_copy = operation.clone();
     let result = removal_batch::send_metadata_only(
@@ -461,43 +578,74 @@ pub(super) async fn run(o: Options<'_>) -> Result<()> {
         &send,
         &control,
         |ready, signature| {
-            durable_write(&root, "started.json", &serde_json::to_vec_pretty(&json!({
-                "status":"started_never_replay",
-                "pid":format!("{pid:016x}"),
-                "ready_sha256":hex(&ready),
-                "operation_sha256":hex(&Sha256::digest(&operation_copy)),
-                "signature_sha256":hex(&Sha256::digest(signature)),
-            }))?)?;
-            Ok(Permit { operation:operation_copy, signature })
+            durable_write(
+                &root,
+                "started.json",
+                &serde_json::to_vec_pretty(&json!({
+                    "status":"started_never_replay",
+                    "pid":format!("{pid:016x}"),
+                    "ready_sha256":hex(&ready),
+                    "operation_sha256":hex(&Sha256::digest(&operation_copy)),
+                    "signature_sha256":hex(&Sha256::digest(signature)),
+                }))?,
+            )?;
+            Ok(Permit {
+                operation: operation_copy,
+                signature,
+            })
         },
-    ).await;
+    )
+    .await;
     match result {
-        Sent::Unsent(error) => return Err(error.context(format!(
-            "nothing was written to the phone; evidence: {}", root.display()
-        ))),
+        Sent::Unsent(error) => {
+            return Err(error.context(format!(
+                "nothing was written to the phone; evidence: {}",
+                root.display()
+            )));
+        }
         Sent::Started(Err(error)) => bail!(
             "playlist session started but outcome uncertain ({error:#}); DO NOT retry. Inspect with rustunes list. Evidence: {}",
             root.display()
         ),
         Sent::Started(Ok(_)) => {}
     }
+    crate::engine::observe(crate::engine::Event::VerificationStarting).context(
+        "playlist session finished but verification could not start; do not retry blindly",
+    )?;
     let (after_identity, after) = removal_batch::capture_fresh(&root.join("after"), &control)
-        .await.context("playlist session finished but verification capture failed; do not retry blindly")?;
-    ensure!(after_identity.device_digest() == identity.device_digest()
-        && after_identity.library_digest() == identity.library_digest(),
-        "verification saw another device/library");
-    verify(&after, &before, pid, o.name, &members)
-        .with_context(|| format!("playlist outcome requires review; never retry blindly. Evidence: {}", root.display()))?;
-    durable_write(&root, "verified.json", &serde_json::to_vec_pretty(&json!({
-        "status":"verified",
-        "playlist_id":format!("{pid:016x}"),
-        "name":o.name,
-        "tracks":members.len(),
-        "anchor":after.anchor(),
-        "audio_unchanged":true,
-        "ordered_membership_verified":true,
-    }))?)?;
-    println!("Verified playlist {:?}: {} tracks in M3U8 order. No audio retransferred.",o.name,members.len());
+        .await
+        .context(
+            "playlist session finished but verification capture failed; do not retry blindly",
+        )?;
+    ensure!(
+        after_identity.device_digest() == identity.device_digest()
+            && after_identity.library_digest() == identity.library_digest(),
+        "verification saw another device/library"
+    );
+    verify(&after, &before, pid, o.name, &members).with_context(|| {
+        format!(
+            "playlist outcome requires review; never retry blindly. Evidence: {}",
+            root.display()
+        )
+    })?;
+    durable_write(
+        &root,
+        "verified.json",
+        &serde_json::to_vec_pretty(&json!({
+            "status":"verified",
+            "playlist_id":format!("{pid:016x}"),
+            "name":o.name,
+            "tracks":members.len(),
+            "anchor":after.anchor(),
+            "audio_unchanged":true,
+            "ordered_membership_verified":true,
+        }))?,
+    )?;
+    println!(
+        "Verified playlist {:?}: {} tracks in M3U8 order. No audio retransferred.",
+        o.name,
+        members.len()
+    );
     println!("Evidence: {}", root.display());
     Ok(())
 }
@@ -513,13 +661,15 @@ mod tests {
         let (bytes, hash, codec) = music_protocol::media::other_audio::read(&path).unwrap();
         assert_eq!(bytes, source.fingerprint.file_bytes);
         assert_eq!(hex(&hash), source.fingerprint.full_file_sha256);
-        assert!(same_mp3_codec(&source, &codec), "MP3 codecs differ for exact same fixture");
+        assert!(
+            same_mp3_codec(&source, &codec),
+            "MP3 codecs differ for exact same fixture"
+        );
     }
 
     #[test]
     fn committed_playlist_has_ten_existing_mp3_files() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/playlist-sync");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/playlist-sync");
         let playlist = root.join("playlist.m3u8");
         let list = entries(&fs::read_to_string(&playlist).unwrap()).unwrap();
         assert_eq!(list.len(), 10);
@@ -527,13 +677,17 @@ mod tests {
         for entry in &list {
             let path = root.join(entry);
             assert!(path.is_file(), "missing fixture {}", path.display());
-            assert!(digests.insert(sha_file(&path).unwrap()), "fixture files duplicate");
+            assert!(
+                digests.insert(sha_file(&path).unwrap()),
+                "fixture files duplicate"
+            );
         }
     }
 
     #[test]
     fn allows_nonempty_playlist_of_up_to_499_entries() {
         assert!(entries("one.mp3\n").is_ok());
+        assert!(entries("one.MP3\n").is_ok());
         assert!(entries("").is_err());
         let many = (1..=500)
             .map(|n| format!("track-{n}.mp3\n"))
@@ -544,12 +698,16 @@ mod tests {
 
     #[test]
     fn reads_only_safe_relative_mp3_entries() {
-        let text = "#EXTM3U\n".to_string() +
-            &(1..=10).map(|n| format!("#EXTINF:5,Track {n}\ngenerated/Flurb-Test-{n:02}.mp3\n"))
+        let text = "#EXTM3U\n".to_string()
+            + &(1..=10)
+                .map(|n| format!("#EXTINF:5,Track {n}\ngenerated/Flurb-Test-{n:02}.mp3\n"))
                 .collect::<String>();
         assert_eq!(entries(&text).unwrap().len(), 10);
         assert!(entries(&text.replace("generated/Flurb-Test-01.mp3", "../escape.mp3")).is_err());
         assert!(entries(&text.replace("generated/Flurb-Test-01.mp3", "/tmp/escape.mp3")).is_err());
-        assert!(entries(&text.replace("generated/Flurb-Test-10.mp3", "generated/Flurb-Test-01.mp3")).is_err());
+        assert!(
+            entries(&text.replace("generated/Flurb-Test-10.mp3", "generated/Flurb-Test-01.mp3"))
+                .is_err()
+        );
     }
 }

@@ -97,6 +97,7 @@ pub(crate) fn read_layout(
         stream: Some(stream),
         apple_timing,
         metadata,
+        fallback_title: None,
         id3_version,
         frames,
         artwork,
@@ -598,7 +599,7 @@ mod tests {
             std::fs::write(&path, flac_with_picture(b"", b"not a picture"))?;
             assert!(read(&path).is_err());
             std::fs::write(&path, flac_with_picture(b"image/jpeg", &png))?;
-            assert!(read(&path).is_err());
+            assert_eq!(read(&path)?.artwork[0].mime, "image/png");
             Ok::<_, anyhow::Error>(())
         })();
         let _ = std::fs::remove_dir_all(&dir);

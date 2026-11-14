@@ -224,7 +224,11 @@ where
                 let record = serde_json::json!({"schema":"rustunes.capture-selection", "selected_attempt":number,
                     "canonical_trace":storage.trace, "state_receipt_sha256":hex(&receipt), "failed_attempts":failures,
                     "maximum_attempts":2, "deadline_renewed":false, "phone_writes":0});
-                write_capture_receipt(&storage.fd_path()?.join("selection.json"), &record, control)?;
+                write_capture_receipt(
+                    &storage.fd_path()?.join("selection.json"),
+                    &record,
+                    control,
+                )?;
                 check_capture(control)?;
                 storage.directory.sync_all()?;
                 check_capture(control)?;
@@ -471,7 +475,10 @@ fn fd_path(file: &File) -> Result<PathBuf> {
     // terminator even if the kernel writes the maximum accepted path length.
     let raw = unsafe { CStr::from_ptr(buffer.as_ptr()) };
     let path = PathBuf::from(OsStr::from_bytes(raw.to_bytes()));
-    ensure!(path.is_absolute(), "held capture directory resolved to a relative path");
+    ensure!(
+        path.is_absolute(),
+        "held capture directory resolved to a relative path"
+    );
     let named = fs::symlink_metadata(&path)?;
     let held = file.metadata()?;
     ensure!(

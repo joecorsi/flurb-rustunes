@@ -31,7 +31,7 @@ use tokio::time::{Instant, sleep, sleep_until};
 use music_protocol::catalogue::sqlite::{Catalog, SourceHashes, Track};
 use music_protocol::media::fingerprint::{self, SourceFingerprint};
 
-pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_FILE_BYTES: u64 = music_protocol::protocol::transfer::MAX_AUDIO;
 pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_TRACKS: usize = 50_000;
 const CATALOG_NAMES: [&str; 3] = [

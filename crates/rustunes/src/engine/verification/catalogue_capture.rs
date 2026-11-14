@@ -238,34 +238,44 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DeviceProvider>>,
 {
-    with_raw_capture_options(trace, deadline, control, nested, connect, |snapshot, control| {
-        let catalog =
-            parse_copied_snapshot_options(&snapshot.database, snapshot.wal.as_deref(), control)?;
-        let verified = catalog.source_hashes();
-        ensure!(
-            verified.database == snapshot.hashes[0].2
-                && verified.database_bytes == snapshot.hashes[0].1,
-            "local catalog database changed during parsing"
-        );
-        let wal = snapshot.hashes.get(1);
-        ensure!(
-            verified.wal == wal.map(|entry| entry.2)
-                && verified.wal_bytes == wal.map(|entry| entry.1),
-            "local catalog WAL changed during parsing"
-        );
-        check_control(control)?;
-        let untested = (!catalog.user_version_tested()).then(|| catalog.user_version());
-        if let Some(version) = untested
-            && WARNED_VERSION.swap(version, Ordering::Relaxed) != version
-        {
-            crate::engine::observe(crate::engine::Event::Observation(
-                crate::engine::Observation::UntestedCatalogueVersion(version),
-            ))?;
-        }
-        let value = consume(catalog)?;
-        check_control(control)?;
-        Ok((value, untested))
-    })
+    with_raw_capture_options(
+        trace,
+        deadline,
+        control,
+        nested,
+        connect,
+        |snapshot, control| {
+            let catalog = parse_copied_snapshot_options(
+                &snapshot.database,
+                snapshot.wal.as_deref(),
+                control,
+            )?;
+            let verified = catalog.source_hashes();
+            ensure!(
+                verified.database == snapshot.hashes[0].2
+                    && verified.database_bytes == snapshot.hashes[0].1,
+                "local catalog database changed during parsing"
+            );
+            let wal = snapshot.hashes.get(1);
+            ensure!(
+                verified.wal == wal.map(|entry| entry.2)
+                    && verified.wal_bytes == wal.map(|entry| entry.1),
+                "local catalog WAL changed during parsing"
+            );
+            check_control(control)?;
+            let untested = (!catalog.user_version_tested()).then(|| catalog.user_version());
+            if let Some(version) = untested
+                && WARNED_VERSION.swap(version, Ordering::Relaxed) != version
+            {
+                crate::engine::observe(crate::engine::Event::Observation(
+                    crate::engine::Observation::UntestedCatalogueVersion(version),
+                ))?;
+            }
+            let value = consume(catalog)?;
+            check_control(control)?;
+            Ok((value, untested))
+        },
+    )
     .await
 }
 
@@ -312,11 +322,16 @@ where
             let scratch = CaptureDirectory::create(None)?;
             let report = if complete {
                 music_protocol::catalogue::sqlite::inventory_snapshot(
-                    &snapshot.database, snapshot.wal.as_deref(), &scratch.path
+                    &snapshot.database,
+                    snapshot.wal.as_deref(),
+                    &scratch.path,
                 )
             } else {
                 music_protocol::catalogue::sqlite::diagnose_snapshot(
-                    &snapshot.database, snapshot.wal.as_deref(), &scratch.path, compare_playlist
+                    &snapshot.database,
+                    snapshot.wal.as_deref(),
+                    &scratch.path,
+                    compare_playlist,
                 )
             };
             // Remove only the empty parent created by this command.

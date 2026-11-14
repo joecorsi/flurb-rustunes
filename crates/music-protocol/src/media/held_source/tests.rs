@@ -129,3 +129,20 @@ fn source_validation_returns_the_same_rewound_handle() {
     bound.check().unwrap();
     assert_eq!(bound.file.metadata().unwrap().ino(), bound.metadata.ino());
 }
+
+#[test]
+fn upload_pin_keeps_size_identity_and_change_checks_without_a_content_pass() {
+    let temp = Temp::new();
+    let path = temp.source();
+    let size = fs::metadata(&path).unwrap().len();
+    let mut held = BoundSource::open_for_upload(&path, size).unwrap();
+    assert_eq!(held.read_for_retention().unwrap(), fs::read(&path).unwrap());
+    assert!(BoundSource::open_for_upload(&path, size + 1).is_err());
+    let link = temp.0.join("symlink");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(BoundSource::open_for_upload(&link, size).is_err());
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[20] ^= 1;
+    fs::write(&path, bytes).unwrap();
+    assert!(held.check().is_err());
+}

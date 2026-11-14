@@ -144,6 +144,19 @@ pub struct EncodedMpeg1Layer3 {
 }
 
 impl EncodedMpeg1Layer3 {
+    /// Shared source/receipt size bound, not proof of valid tag contents.
+    /// Source/readback inspection validates APE framing and every complete audio
+    /// frame; the full-file hash includes APE, ID3v1 and any partial last frame.
+    pub fn valid_trailing_bytes(sample_rate: u32, frame_count: u32, bytes: u64) -> bool {
+        matches!(sample_rate, 32000 | 44100 | 48000)
+            && (matches!(bytes, 0 | 128)
+                || (frame_count >= 2
+                    && bytes
+                        <= crate::media::mpeg_layout::MAX_TRAILING
+                            + u64::from(144_000 * 320 / sample_rate)
+                            + 128))
+    }
+
     /// The same real-frame identity used by MP3 source inspection. Coded sample
     /// count is derived, never interpreted as native or gapless duration.
     pub fn sha256(&self) -> [u8; 32] {
@@ -168,8 +181,12 @@ impl EncodedMpeg1Layer3 {
         let frames = u64::from(self.frame_count);
         ensure!(
             (frames * 96..=frames * 1441).contains(&self.audio_bytes)
-                && self.audio_offset <= 16 * 1024 * 1024 + 20
-                && matches!(self.trailing_bytes, 0 | 128)
+                && self.audio_offset <= crate::media::mpeg_layout::MAX_PREFIX
+                && Self::valid_trailing_bytes(
+                    self.sample_rate,
+                    self.frame_count,
+                    self.trailing_bytes
+                )
                 && self
                     .audio_offset
                     .checked_add(self.audio_bytes)
@@ -239,7 +256,8 @@ impl TransferredSource {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            (1..=512 * 1024 * 1024).contains(&self.file_bytes) && self.full_file_sha256 != [0; 32],
+            (1..=crate::protocol::transfer::MAX_AUDIO).contains(&self.file_bytes)
+                && self.full_file_sha256 != [0; 32],
             "invalid transferred source bounds"
         );
         match &self.audio.codec {

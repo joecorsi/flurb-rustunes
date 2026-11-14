@@ -289,7 +289,7 @@ fn process(name: &str) -> Option<u32> {
 }
 
 fn running(process: u32) -> bool {
-    Path::new(&format!("/proc/{process}")).exists()
+    crate::engine::state::process::is_alive(process)
 }
 
 /// Whether the conversion directory `name` belongs to another process that
@@ -580,7 +580,7 @@ fn check(
     let size = fs::symlink_metadata(output)?.len();
     ensure!(
         size <= music_protocol::protocol::transfer::MAX_AUDIO,
-        "its ALAC is {size} bytes, over the 64 MiB transfer limit"
+        "its ALAC is {size} bytes, outside the native catalogue size representation"
     );
     let fingerprint = music_protocol::media::fingerprint::read(output)
         .context("FFmpeg's ALAC cannot be read as an ALAC source")?;

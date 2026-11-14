@@ -3,7 +3,7 @@
 https://github.com/user-attachments/assets/8350b85a-0c21-402b-bded-077573885e0d
 
 <p align="center">
-  Sync your music to the stock iPhone Music app from Linux, over USB or Wi-Fi.<br>
+  Sync your music to the stock iPhone Music app from macOS or Linux, over USB or Wi-Fi.<br>
   No iTunes, no Finder, no Windows, no jailbreak.
 </p>
 
@@ -22,7 +22,8 @@ https://github.com/user-attachments/assets/8350b85a-0c21-402b-bded-077573885e0d
 ## About
 
 The Music app on an iPhone only plays what Apple's own sync software put there:
-Finder on a Mac, or the Apple Devices app on Windows. Linux has neither.
+Finder on a Mac, or the Apple Devices app on Windows. On macOS and Linux,
+rustunes provides another way to manage the phone's Music library.
 
 **rustunes** fills that gap. Point it at a folder of music and it puts the
 tracks into the phone's own Music library, the same library Finder fills, with
@@ -72,7 +73,7 @@ from the protocol analysis to the code.
 
 | What | Required? | Why |
 | --- | --- | --- |
-| **Linux** (x86_64 tested) | Required | rustunes is Linux-only. |
+| **macOS or Linux** | Required | Both platforms are supported; Linux x86_64 is tested. |
 | **An iPhone** paired with and trusting this computer | Required | See [Supported phones](#supported-phones) and [Getting started](#getting-started). |
 | **usbmuxd** | Required | Talks to the phone over USB, and saves the pairing record that Wi-Fi uses too. Most distributions start it automatically when an iPhone is plugged in. |
 | **FFmpeg** on `PATH` | Required to send covers | Verifies covers on the phone. Also used by `--flac-to-alac` and `validate --decode`. Without it, a sync that has covers to send stops before sending anything. |
@@ -783,9 +784,12 @@ covers).
 
 - **No backup.** Removed tracks exist only in your source files.
 - **Tested on one phone and two iOS versions** (see [Supported phones](#supported-phones)).
-- **No playlist editing.** rustunes does not create or edit playlists. It
-  removes members of ordinary playlists when it removes a track, and refuses to
-  remove members of smart playlists, folders or playlists made on the phone.
+- **Limited playlist editing API.** Flurb can create or update an ordinary
+  playlist linked to its stable local identity, up to 499 unique installed MP3
+  tracks. Updates verify membership, order, name, and unchanged audio/other
+  playlists before saving a baseline. Smart/cloud playlists and phone-side
+  edits are refused; two-way playlist merging is not implemented. The original
+  `push playlist.m3u8` trial remains create-only.
 - **Albums and artists can linger.** The phone decides when to drop an emptied
   album or artist, and some stay after their tracks are removed.
 - **Some tag changes need a replacement.** Clearing a genre or composer can't
@@ -868,3 +872,9 @@ repository. Use it at your own risk: it writes to your phone's music library.
 
 rustunes and its `music-protocol` library are released under the
 [MIT License](LICENSE).
+
+### Flurb compatibility and local checks
+
+The Flurb integration preserves the original source files. MPEG catalogue projection uses **Unknown Album** when the album tag is absent and maps standard numeric ID3 genres to their labels. The reader also accepts ID3v2.2, non-transforming frame-status flags, empty frames, and recognized artwork MIME labels that disagree with validated image bytes. A partial final MPEG-1 frame remains in the transferred file and full-file hash, but is excluded from complete-frame timing; malformed headers and unbounded/truncated metadata still refuse. Long Lavf encoder identifiers are not interpreted as LAME trim fields.
+
+Run `bash scripts/check.sh` for the workspace tests. The script resolves macOS's temporary-directory alias before starting fixtures, while keeping SQLite's `NOFOLLOW` checks enabled. FFmpeg must be on `PATH` for decoder tests and live artwork verification.

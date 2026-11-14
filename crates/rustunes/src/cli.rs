@@ -7,10 +7,10 @@ pub(crate) mod device_view;
 pub(crate) mod journal_view;
 pub(crate) mod library_view;
 mod list_view;
-mod playlist_push;
 mod logging;
 mod machine;
 mod metadata_set;
+mod playlist_push;
 mod progress;
 mod pull;
 mod recovery;
@@ -626,7 +626,9 @@ pub async fn run() -> Result<ExitCode> {
             if verbose {
                 eprintln!("Details: {error:#}");
             } else {
-                eprintln!("Hint: Check the connection and unlock the iPhone; use --verbose for details.");
+                eprintln!(
+                    "Hint: Check the connection and unlock the iPhone; use --verbose for details."
+                );
             }
             if let Some(path) = logging::path() {
                 eprintln!("Log: {}", path.display());
@@ -843,8 +845,9 @@ fn sources_to_warm(command: &Command) -> Option<(PathBuf, source_collection::Sel
                 ..Default::default()
             },
         )),
-        Command::Push { path: Some(path), .. }
-            if path.extension().and_then(|ext| ext.to_str()) == Some("m3u8") => None,
+        Command::Push {
+            path: Some(path), ..
+        } if path.extension().and_then(|ext| ext.to_str()) == Some("m3u8") => None,
         Command::Push {
             path,
             recursive,
@@ -1228,13 +1231,19 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
             let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
             if path.extension().and_then(|ext| ext.to_str()) == Some("m3u8") {
                 anyhow::ensure!(
-                    snapshot.is_none() && journal.is_none() && !recursive
-                        && include.is_empty() && exclude.is_empty() && !flac_to_alac,
+                    snapshot.is_none()
+                        && journal.is_none()
+                        && !recursive
+                        && include.is_empty()
+                        && exclude.is_empty()
+                        && !flac_to_alac,
                     "playlist push accepts --playlist-name and --dry-run; track selection flags are not supported"
                 );
                 let name = match playlist_name.as_deref() {
                     Some(name) => name,
-                    None => path.file_stem().and_then(|name| name.to_str())
+                    None => path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
                         .context("playlist file has no usable name; pass --playlist-name")?,
                 };
                 playlist_push::run(playlist_push::Options {
@@ -1244,7 +1253,8 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                     host_name: &host_name,
                     dry_run,
                     seconds,
-                }).await?;
+                })
+                .await?;
                 return Ok(ExitCode::SUCCESS);
             }
             anyhow::ensure!(
@@ -1560,28 +1570,50 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
         } => {
             // A read-only inventory must not require the strict track model used
             // for planning writes. Surface broken joins as warnings instead.
-            if matches!(&view, LibraryCommand::Stats | LibraryCommand::Playlists { .. }) && snapshot.is_none() {
+            if matches!(
+                &view,
+                LibraryCommand::Stats | LibraryCommand::Playlists { .. }
+            ) && snapshot.is_none()
+            {
                 let playlists_view = matches!(&view, LibraryCommand::Playlists { .. });
                 let compare_playlist = match &view {
                     LibraryCommand::Playlists { compare_favorites } => compare_favorites.as_deref(),
                     _ => None,
                 };
-                let report = catalogue_capture::diagnose(trace_dir.as_deref(), compare_playlist, device::provider).await?;
+                let report = catalogue_capture::diagnose(
+                    trace_dir.as_deref(),
+                    compare_playlist,
+                    device::provider,
+                )
+                .await?;
                 if machine::enabled() {
-                    machine::report(if playlists_view { "library_playlists" } else { "library_stats" }, &report)?;
+                    machine::report(
+                        if playlists_view {
+                            "library_playlists"
+                        } else {
+                            "library_stats"
+                        },
+                        &report,
+                    )?;
                 } else {
                     let mut output = std::io::stdout().lock();
                     if json {
                         serde_json::to_writer_pretty(&mut output, &report)?;
                         writeln!(output)?;
                     } else if playlists_view {
-                        library_view::write_playlists(&report, compare_playlist.is_some(), &mut output)?;
+                        library_view::write_playlists(
+                            &report,
+                            compare_playlist.is_some(),
+                            &mut output,
+                        )?;
                     } else {
                         let stats = &report["stats"];
-                        let shown = |name: &str| stats[name]
-                            .as_i64()
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "unavailable".into());
+                        let shown = |name: &str| {
+                            stats[name]
+                                .as_i64()
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unavailable".into())
+                        };
                         writeln!(
                             output,
                             "{} tracks · {} album IDs · {} album-artist IDs (including zero)",
@@ -1596,7 +1628,10 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                         )?;
                         if let Some(warnings) = report["warnings"].as_array() {
                             if warnings.is_empty() {
-                                writeln!(output, "No anomalies found by the initial diagnostic checks.")?;
+                                writeln!(
+                                    output,
+                                    "No anomalies found by the initial diagnostic checks."
+                                )?;
                             } else {
                                 writeln!(output, "Diagnostic findings (no records changed):")?;
                                 for warning in warnings {
@@ -1620,43 +1655,47 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                     output.flush()?;
                 }
             } else {
-            let view = match view {
-                LibraryCommand::List {
-                    query,
-                    artist,
-                    album,
-                } => library_view::View::List(library_view::Filter {
-                    query,
-                    artist,
-                    album,
-                }),
-                LibraryCommand::Show { id } => library_view::View::Show(id),
-                LibraryCommand::Stats => library_view::View::Stats,
-                LibraryCommand::Playlists { .. } => anyhow::bail!("offline snapshot playlist diagnostics not supported; connect the iPhone"),
-            };
-            let catalog = if let Some(directory) = snapshot {
-                let line = "Reading saved snapshot; no live device check";
-                if machine::enabled() {
-                    machine::phase("read_snapshot", Some(line.into()))?;
+                let view = match view {
+                    LibraryCommand::List {
+                        query,
+                        artist,
+                        album,
+                    } => library_view::View::List(library_view::Filter {
+                        query,
+                        artist,
+                        album,
+                    }),
+                    LibraryCommand::Show { id } => library_view::View::Show(id),
+                    LibraryCommand::Stats => library_view::View::Stats,
+                    LibraryCommand::Playlists { .. } => anyhow::bail!(
+                        "offline snapshot playlist diagnostics not supported; connect the iPhone"
+                    ),
+                };
+                let catalog = if let Some(directory) = snapshot {
+                    let line = "Reading saved snapshot; no live device check";
+                    if machine::enabled() {
+                        machine::phase("read_snapshot", Some(line.into()))?;
+                    } else {
+                        eprintln!("{line}");
+                    }
+                    crate::engine::state::snapshot::open(&directory)?.catalog
                 } else {
-                    eprintln!("{line}");
+                    catalogue_capture::read(trace_dir.as_deref(), device::provider).await?
+                };
+                let kind = match view {
+                    library_view::View::List(_) => "library_list",
+                    library_view::View::Show(_) => "library_track",
+                    library_view::View::Stats => "library_stats",
+                };
+                if machine::enabled() {
+                    machine::report_from(kind, |out| {
+                        library_view::write(&catalog, &view, true, out)
+                    })?;
+                } else {
+                    let mut output = std::io::stdout().lock();
+                    library_view::write(&catalog, &view, json, &mut output)?;
+                    output.flush()?;
                 }
-                crate::engine::state::snapshot::open(&directory)?.catalog
-            } else {
-                catalogue_capture::read(trace_dir.as_deref(), device::provider).await?
-            };
-            let kind = match view {
-                library_view::View::List(_) => "library_list",
-                library_view::View::Show(_) => "library_track",
-                library_view::View::Stats => "library_stats",
-            };
-            if machine::enabled() {
-                machine::report_from(kind, |out| library_view::write(&catalog, &view, true, out))?;
-            } else {
-                let mut output = std::io::stdout().lock();
-                library_view::write(&catalog, &view, json, &mut output)?;
-                output.flush()?;
-            }
             }
         }
         Command::Catalog { output, trace_dir } if machine::enabled() => {
@@ -2293,7 +2332,10 @@ async fn list_device_name() -> Option<String> {
         lockdown.start_session(&pairing).await?;
         let value = lockdown.get_value(Some("DeviceName"), None).await?;
         Ok::<_, anyhow::Error>(value.as_string().map(str::to_owned))
-    }).await.ok()?.ok()?
+    })
+    .await
+    .ok()?
+    .ok()?
 }
 
 async fn device_info(
@@ -2643,6 +2685,120 @@ fn default_state_directory() -> Result<PathBuf> {
     Ok(home.join(".local/state/rustunes"))
 }
 
+/// Stable-ID playlist synchronization for frontends.
+pub use playlist_push::managed::{Report as PlaylistSyncReport, Request as PlaylistSyncRequest};
+
+pub use playlist_push::managed::DeleteRequest as DeletePlaylistRequest;
+pub use playlist_push::managed::favorites::{
+    Baseline as FavoriteBaseline, Report as FavoriteSyncReport, Request as FavoriteSyncRequest,
+    ResultTrack as FavoriteResultTrack, Track as FavoriteTrack,
+};
+pub fn decode_favorite_baselines(text: &str) -> Result<Vec<FavoriteBaseline>> {
+    playlist_push::managed::favorites::decode_baselines(text)
+}
+pub fn accept_favorite_sync(state: &std::path::Path, receipt: &str) -> Result<()> {
+    playlist_push::managed::favorites::accept(state, receipt)
+}
+pub async fn sync_favorites(
+    request: FavoriteSyncRequest<'_>,
+    engine: &engine::Engine,
+) -> Result<FavoriteSyncReport> {
+    engine
+        .scope(playlist_push::managed::favorites::run(request))
+        .await
+}
+pub async fn recover_favorite_sync(
+    state: &std::path::Path,
+    seconds: u64,
+    engine: &engine::Engine,
+) -> Result<()> {
+    engine
+        .scope(playlist_push::managed::favorites::recover_only(
+            state, seconds,
+        ))
+        .await
+}
+pub use playlist_push::managed::reconcile::{
+    Change as IncomingPlaylistChange, Choice as PlaylistChoice, Conflict as PlaylistConflict,
+    LocalPlaylist as IncomingLocalPlaylist, LocalTrack as IncomingLocalTrack, PlaylistState,
+    Report as IncomingPlaylistReport, Request as IncomingPlaylistRequest,
+    Resolution as PlaylistResolution,
+};
+pub async fn incoming_playlists(
+    request: IncomingPlaylistRequest<'_>,
+    engine: &engine::Engine,
+) -> Result<IncomingPlaylistReport> {
+    engine
+        .scope(playlist_push::managed::reconcile::run(request, engine))
+        .await
+}
+pub fn accept_incoming_playlists(state: &std::path::Path, receipt: &str) -> Result<()> {
+    playlist_push::managed::reconcile::accept(state, receipt)
+}
+pub async fn delete_synced_playlist(
+    request: DeletePlaylistRequest<'_>,
+    engine: &engine::Engine,
+) -> Result<PlaylistSyncReport> {
+    engine.scope(playlist_push::managed::delete(request)).await
+}
+
+/// Observe pending playlist outcomes before beginning another audio sync.
+pub async fn recover_playlist_sync(
+    state: &std::path::Path,
+    seconds: u64,
+    engine: &engine::Engine,
+) -> Result<()> {
+    engine
+        .scope(playlist_push::managed::recover(state, seconds))
+        .await
+}
+
+pub use playlist_push::managed::batch::{
+    Progress as PlaylistBatchProgress, Report as PlaylistBatchReport,
+    Request as PlaylistBatchRequest,
+};
+/// Apply bounded groups of playlist changes, acknowledging only verified groups.
+pub async fn sync_playlists(
+    request: PlaylistBatchRequest<'_>,
+    engine: &engine::Engine,
+    progress: &mut impl FnMut(PlaylistBatchProgress<'_>) -> Result<()>,
+) -> Result<PlaylistBatchReport> {
+    engine
+        .scope(playlist_push::managed::batch::run(request, progress))
+        .await
+}
+
+/// Create/update the playlist mapped to a stable frontend identity, advancing
+/// its baseline only after exact membership and noninterference verification.
+pub async fn sync_playlist(
+    request: PlaylistSyncRequest<'_>,
+    engine: &engine::Engine,
+) -> Result<PlaylistSyncReport> {
+    engine.scope(playlist_push::managed::run(request)).await
+}
+
+/// Create and verify a new playlist using the original create-only trial.
+pub async fn push_playlist(
+    playlist: &std::path::Path,
+    name: &str,
+    state: &std::path::Path,
+    host_name: &str,
+    dry_run: bool,
+    seconds: u64,
+    engine: &engine::Engine,
+) -> Result<()> {
+    engine
+        .scope(playlist_push::run(playlist_push::Options {
+            playlist,
+            name,
+            state,
+            host_name,
+            dry_run,
+            seconds,
+        }))
+        .await
+}
+
 async fn remove(
     options: deletion::Options,
     mode: engine::DeletionMode,
@@ -2661,4 +2817,17 @@ async fn remove(
         })
         .await?
         .ready())
+}
+
+/// Validate a local file against the actual native iPhone insertion profile.
+/// No device access, rewriting or insertion authority is granted.
+pub fn check_iphone_source(path: &std::path::Path) -> anyhow::Result<()> {
+    let source = crate::engine::planning::source_reads::mpeg(path)?;
+    let assessment = crate::engine::planning::source_collection::mp3::preparation::assess(&source);
+    let reasons: Vec<_> = assessment
+        .batch_refusals()
+        .map(|i| i.detail.as_str())
+        .collect();
+    anyhow::ensure!(reasons.is_empty(), "{}", reasons.join("; "));
+    Ok(())
 }

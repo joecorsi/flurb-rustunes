@@ -58,16 +58,6 @@ pub(crate) fn load_read_only_with_control(
     load_with_access(plan_path, snapshot_path, journal_path, Some(control), false)
 }
 
-/// Sync's initial cover/source expectations are inspection only. The later
-/// actual Apply loader still independently reconstructs and gates execution.
-pub(crate) fn load_sync_expectations(
-    plan_path: &Path,
-    snapshot_path: &Path,
-    journal_path: &Path,
-) -> Result<Validated> {
-    load_with_access(plan_path, snapshot_path, journal_path, None, true)
-}
-
 fn load_with_access(
     plan_path: &Path,
     snapshot_path: &Path,

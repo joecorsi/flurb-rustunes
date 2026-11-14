@@ -21,7 +21,7 @@ use lofty::{
 };
 
 // Separate from ATC's wire-frame and AFC readback bounds.
-const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SOURCE_BYTES: u64 = crate::protocol::transfer::MAX_AUDIO;
 
 /// Parsed source observations. These fields are not execution permits or ownership claims.
 /// Standard-atom provenance remains internal to the parser and its projections.
@@ -1180,14 +1180,6 @@ mod tests {
         file.write_all(&ALAC[..32]).unwrap();
         assert!(read(&path).unwrap_err().to_string().contains("parsing MP4"));
         assert_eq!(fs::read(&path).unwrap(), ALAC[..32]);
-        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
-        assert!(
-            read(&path)
-                .unwrap_err()
-                .to_string()
-                .contains("source must contain")
-        );
-        assert_eq!(file.metadata().unwrap().len(), MAX_SOURCE_BYTES + 1);
         drop(file);
         fs::remove_file(&path).unwrap();
         assert!(

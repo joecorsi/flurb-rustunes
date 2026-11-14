@@ -93,7 +93,7 @@ pub fn assess(source: &Source) -> Assessment {
             &mut issues,
             "mp3_native_transfer_size_limit",
             format!(
-                "Source has {} bytes; the existing native audio transfer limit is {} bytes (64 MiB)",
+                "Source has {} bytes; the native catalogue size representation supports {} bytes",
                 source.fingerprint.file_bytes,
                 music_protocol::protocol::transfer::MAX_AUDIO
             ),
@@ -212,9 +212,9 @@ impl PreparedSource {
     pub fn read_expected(path: &Path, expected: &Source) -> Result<Self> {
         ensure!(
             expected.fingerprint.file_bytes <= music_protocol::protocol::transfer::MAX_AUDIO,
-            "MPEG source exceeds the existing 64 MiB native audio transfer limit"
+            "MPEG source exceeds the native catalogue size representation"
         );
-        let source = music_protocol::media::mpeg::read(path)?;
+        let source = crate::engine::planning::source_reads::mpeg(path)?;
         ensure!(&source == expected, "MPEG source changed after selection");
         let identity = source.transferred_identity()?;
         let assessment = assess(&source);

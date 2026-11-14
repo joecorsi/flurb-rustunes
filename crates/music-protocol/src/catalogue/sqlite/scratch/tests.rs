@@ -11,6 +11,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn held_locator(file: &File) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let mut path = [0u8; libc::PATH_MAX as usize];
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) },
+            0
+        );
+        use std::os::unix::ffi::OsStrExt;
+        let end = path.iter().position(|b| *b == 0).unwrap();
+        PathBuf::from(std::ffi::OsStr::from_bytes(&path[..end]))
+    }
+    #[cfg(not(target_os = "macos"))]
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
 fn control() -> ReadControl {
     ReadControl {
         deadline: Instant::now() + Duration::from_secs(30),
@@ -94,7 +110,7 @@ fn held_parent_reads_all_storage_modes_without_changing_inputs() {
         let db_before = hash_file(&fixture.database, MAX_DATABASE_BYTES).unwrap();
         let wal_before = supplied_wal.map(|path| hash_file(path, MAX_WAL_BYTES).unwrap());
         let parent = File::open(&fixture.directory.0).unwrap();
-        let held_path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
+        let held_path = held_locator(&parent);
         let policy = control();
         for mode in 0..4 {
             let read = |scratch: &Path| match mode {
@@ -171,7 +187,7 @@ fn renamed_parent_or_child_refuses_and_cleans_only_owned_files() {
         let moved = fixture.directory.0.join("moved");
         fs::create_dir(&parent).unwrap();
         let held_parent = File::open(&parent).unwrap();
-        let locator = PathBuf::from(format!("/proc/self/fd/{}", held_parent.as_raw_fd()));
+        let locator = held_locator(&held_parent);
         let mut owned_path = PathBuf::new();
         let mut replacement = PathBuf::new();
         let result = with_scratch(&locator, None, |scratch| {

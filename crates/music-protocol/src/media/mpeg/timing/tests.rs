@@ -143,7 +143,6 @@ fn contradictory_xing_fields_trim_and_reserved_flags_refuse() {
     let original = xing(false, 0, Some(b"LAME"));
     for (at, data, message) in [
         (44, 3u32.to_be_bytes().to_vec(), "frame count"),
-        (48, 0u32.to_be_bytes().to_vec(), "stream size"),
         (40, 16u32.to_be_bytes().to_vec(), "flags"),
         (73, vec![255; 3], "trim"),
         (61, vec![0x10], "revision"),
@@ -357,4 +356,51 @@ fn bounds_count_format_and_truncated_frame_are_not_duration_estimates() {
     let mut b = b;
     b[1] = 0xf3;
     assert!(inspect_bytes(&b, 2, 2).is_err());
+}
+
+#[test]
+fn a_long_lavf_identifier_is_not_mistaken_for_lame_revision_or_trim() {
+    let mut bytes = xing(false, 0, Some(b"Lavf"));
+    bytes[61] = b'1';
+    let Some(SeekHeader::Xing(info)) = inspect_bytes(&bytes, 3, 2).unwrap().header else {
+        panic!()
+    };
+    assert!(info.encoder.is_none());
+    assert_eq!(info.declared_audio_frames, Some(2));
+}
+
+#[test]
+fn stale_xing_byte_estimate_keeps_observed_frames_and_original_declaration() {
+    let mut bytes = xing(false, 0, Some(b"LAME"));
+    let stale = bytes.len() as u32 + 2304;
+    bytes[48..52].copy_from_slice(&stale.to_be_bytes());
+    let result = inspect_bytes(&bytes, 3, 2).unwrap();
+    assert_eq!(result.physical.frame_count, 3);
+    let Some(SeekHeader::Xing(header)) = result.header else {
+        panic!("missing Xing")
+    };
+    assert_eq!(header.declared_stream_bytes, Some(stale));
+    assert_eq!(header.declared_audio_frames, Some(2));
+    bytes[44..48].copy_from_slice(&3u32.to_be_bytes());
+    assert!(inspect_bytes(&bytes, 3, 2).is_err());
+}
+
+#[test]
+fn empty_xing_count_and_size_are_placeholders_not_a_zero_length_stream() {
+    let mut bytes = xing(false, 0, Some(b"LAME"));
+    bytes[44..52].fill(0);
+    let evidence = inspect_bytes(&bytes, 3, 2).unwrap();
+    assert_eq!(evidence.physical.frame_count, 3);
+    assert_eq!(evidence.excluding_xing_info_frame.unwrap().frame_count, 2);
+    let Some(SeekHeader::Xing(header)) = evidence.header else {
+        panic!("missing Xing")
+    };
+    assert_eq!(header.declared_audio_frames, Some(0));
+    assert_eq!(header.declared_stream_bytes, Some(0));
+    // A correct positive frame count may also have an unset byte estimate.
+    bytes[44..48].copy_from_slice(&2u32.to_be_bytes());
+    assert!(inspect_bytes(&bytes, 3, 2).is_ok());
+    // Positive frame counts still must agree with the actual frame chain.
+    bytes[44..48].copy_from_slice(&4u32.to_be_bytes());
+    assert!(inspect_bytes(&bytes, 3, 2).is_err());
 }

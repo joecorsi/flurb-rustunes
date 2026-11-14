@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{
-    Connection, OpenFlags, Row,
+    Connection, OpenFlags, OptionalExtension, Row,
     config::DbConfig,
     hooks::{AuthAction, Authorization},
     limits::Limit,
@@ -38,9 +38,9 @@ pub const USER_VERSION_FLOOR: i64 = 2_400_060;
 /// version at or above the floor is read, and `Catalog` reports it untested.
 pub const TESTED_USER_VERSIONS: &[i64] = &[2_400_060, 2_410_000];
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-mod scratch;
 mod diagnostics;
 mod playlist_inspection;
+mod scratch;
 pub mod tables;
 mod without;
 
@@ -101,7 +101,7 @@ impl Catalog {
     pub fn primary_container_pid(&self) -> u64 {
         self.primary_container_pid
     }
-    /// Persisted state only; a negotiated Ready response remains independent.
+    /// Persisted state (zero when absent); negotiated Ready remains independent.
     pub fn persisted_media_anchor(&self) -> u32 {
         self.anchor
     }
@@ -607,9 +607,7 @@ enum SnapshotStorage {
 impl SnapshotStorage {
     fn input_limits(self) -> (u64, u64) {
         match self {
-            Self::Current | Self::Legacy | Self::MemoryTemp => {
-                (MAX_DATABASE_BYTES, MAX_WAL_BYTES)
-            }
+            Self::Current | Self::Legacy | Self::MemoryTemp => (MAX_DATABASE_BYTES, MAX_WAL_BYTES),
         }
     }
     fn memory_temp(self) -> bool {
@@ -1563,7 +1561,11 @@ fn parse_catalog(
             [],
             |r| r.get(0),
         )
-        .context("persisted Media anchor absent")?;
+        .optional()
+        .context("read persisted Media anchor")?
+        // ML sync client's currentSyncAnchor returns "0" when this property
+        // is absent (docs/09, section 6.4). Never reuse a prior host anchor.
+        .unwrap_or_else(|| "0".to_owned());
     check_control(control)?;
     ensure!(
         !anchor_text.is_empty()
@@ -2297,7 +2299,7 @@ mod current_storage_profile_tests {
     use super::*;
     #[test]
     fn controlled_real_sqlite_uses_memory_temp_and_preserves_source_bytes() {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "current-sqlite-memory-{}-{}",
             std::process::id(),
             SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -2333,7 +2335,7 @@ mod current_storage_profile_tests {
     }
     #[test]
     fn current_sqlite_cancellation_is_checked_before_scratch_creation() {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "current-sqlite-cancel-{}-{}",
             std::process::id(),
             SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)

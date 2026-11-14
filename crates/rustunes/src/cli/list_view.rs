@@ -12,13 +12,16 @@ fn visible_playlist(value: &Value) -> bool {
 }
 
 fn safe(value: &str) -> String {
-    value.chars().flat_map(|c| {
-        if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-            c.escape_default().collect::<Vec<_>>()
-        } else {
-            vec![c]
-        }
-    }).collect()
+    value
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 fn grouped(value: i64) -> String {
@@ -41,11 +44,19 @@ pub(super) fn write(
     verbose: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let tracks = report["stats"]["tracks"].as_i64().context("track count unavailable")?;
-    let albums = report["stats"]["album_ids"].as_i64().context("album count unavailable")?;
-    let all = report["playlists"].as_array().context("playlist inventory unavailable")?;
+    let tracks = report["stats"]["tracks"]
+        .as_i64()
+        .context("track count unavailable")?;
+    let albums = report["stats"]["album_ids"]
+        .as_i64()
+        .context("album count unavailable")?;
+    let all = report["playlists"]
+        .as_array()
+        .context("playlist inventory unavailable")?;
     let playlists: Vec<_> = all.iter().filter(|p| visible_playlist(p)).collect();
-    let issues = report["warnings"].as_array().context("catalogue warnings unavailable")?;
+    let issues = report["warnings"]
+        .as_array()
+        .context("catalogue warnings unavailable")?;
     ensure!(
         !issues.iter().any(|issue| matches!(
             issue["code"].as_str(),
@@ -54,9 +65,18 @@ pub(super) fn write(
         "playlist inventory incomplete"
     );
     if json_output {
-        ensure!(report["tracks"].is_array(), "detailed track inventory unavailable");
-        ensure!(report["albums"].is_array(), "detailed album inventory unavailable");
-        ensure!(report["playlist_membership"].is_object(), "playlist membership unavailable");
+        ensure!(
+            report["tracks"].is_array(),
+            "detailed track inventory unavailable"
+        );
+        ensure!(
+            report["albums"].is_array(),
+            "detailed album inventory unavailable"
+        );
+        ensure!(
+            report["playlist_membership"].is_object(),
+            "playlist membership unavailable"
+        );
         let mut result = report.clone();
         result["schema"] = json!("rustunes.list.v1");
         result["device"] = json!({"name": device_name});
@@ -66,7 +86,11 @@ pub(super) fn write(
         return Ok(());
     }
 
-    writeln!(out, "iPhone: {}", safe(device_name.unwrap_or("Connected iPhone")))?;
+    writeln!(
+        out,
+        "iPhone: {}",
+        safe(device_name.unwrap_or("Connected iPhone"))
+    )?;
     writeln!(out, "\nLibrary")?;
     writeln!(out, "  Tracks:    {}", grouped(tracks))?;
     writeln!(out, "  Albums:    {}", grouped(albums))?;
@@ -77,20 +101,31 @@ pub(super) fn write(
     } else {
         writeln!(out, "  {:<16}  {:<32}  {:>8}", "ID", "NAME", "TRACKS")?;
         for playlist in playlists {
-            let id = playlist["container_pid"].as_str().context("playlist ID unavailable")?;
+            let id = playlist["container_pid"]
+                .as_str()
+                .context("playlist ID unavailable")?;
             let name = safe(playlist["name"].as_str().unwrap_or("(unnamed)"));
-            let count = playlist["music_members"].as_i64().context("playlist track count unavailable")?;
+            let count = playlist["music_members"]
+                .as_i64()
+                .context("playlist track count unavailable")?;
             writeln!(out, "  {:<16}  {:<32}  {:>8}", id, name, grouped(count))?;
         }
     }
     if !issues.is_empty() {
-        writeln!(out, "\nNote: {} catalogue diagnostic(s). Use --verbose for details.", issues.len())?;
+        writeln!(
+            out,
+            "\nNote: {} catalogue diagnostic(s). Use --verbose for details.",
+            issues.len()
+        )?;
         if verbose {
             for issue in issues {
                 let code = safe(issue["code"].as_str().unwrap_or("unknown"));
-                let message = safe(issue["message"].as_str()
-                    .or_else(|| issue["query_error"].as_str())
-                    .unwrap_or("see list --json"));
+                let message = safe(
+                    issue["message"]
+                        .as_str()
+                        .or_else(|| issue["query_error"].as_str())
+                        .unwrap_or("see list --json"),
+                );
                 writeln!(out, "  [{code}] {message}")?;
             }
         }
@@ -139,7 +174,10 @@ mod tests {
         assert_eq!(result["schema"], "rustunes.list.v1");
         assert_eq!(result["visible_playlist_count"], 2);
         assert_eq!(result["tracks"][0]["title"], "Song");
-        assert_eq!(result["playlist_membership"]["82"][0]["track_id"], "ffffffffffffffff");
+        assert_eq!(
+            result["playlist_membership"]["82"][0]["track_id"],
+            "ffffffffffffffff"
+        );
     }
 
     #[test]
@@ -148,7 +186,11 @@ mod tests {
         report["warnings"] = json!([{"code":"broken_join","message":"Details here"}]);
         let mut out = Vec::new();
         write(&report, None, false, false, &mut out).unwrap();
-        assert!(!String::from_utf8(out.clone()).unwrap().contains("Details here"));
+        assert!(
+            !String::from_utf8(out.clone())
+                .unwrap()
+                .contains("Details here")
+        );
         out.clear();
         write(&report, None, false, true, &mut out).unwrap();
         assert!(String::from_utf8(out).unwrap().contains("Details here"));

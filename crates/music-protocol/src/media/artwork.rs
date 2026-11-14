@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
-const MAX_SOURCE: u64 = 512 * 1024 * 1024;
+const MAX_SOURCE: u64 = crate::protocol::transfer::MAX_AUDIO;
 const MAX_COVER: u64 = 32 * 1024 * 1024;
 const MAX_BOXES: usize = 4096;
 

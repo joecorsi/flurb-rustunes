@@ -77,6 +77,9 @@ pub(crate) fn reason(
             .join(", ")
     };
     match code {
+        "source_inspection_failed" if message.contains("audio frames validated") => {
+            "its audio frames are readable, but its ID3 metadata could not be read. Open Track Info or repair its tags in Library Editor; the details below identify the metadata issue.".into()
+        }
         "source_inspection_failed" => {
             "rustunes couldn't read it as a music file. Check that it plays, or encode it again."
                 .into()
@@ -280,7 +283,7 @@ fn batch_problem(code: &str, detail: &str) -> (String, String) {
     match code {
         "mp3_metadata_policy_required" => tag_problem(detail),
         "mp3_native_transfer_size_limit" => (
-            "it is larger than the 64 MiB rustunes sends as one track".into(),
+            "its size cannot be represented in the phone catalogue".into(),
             "Encode it smaller.".into(),
         ),
         "mp3_timing_policy_required" => (

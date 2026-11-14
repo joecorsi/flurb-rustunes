@@ -131,7 +131,11 @@ impl Audio {
             Self::Alac { fingerprint, .. } => BoundSource::open(path, fingerprint),
             Self::Mpeg(source) => {
                 let identity = source.identity();
-                BoundSource::open_observed(path, identity.file_bytes, identity.full_file_sha256)
+                // Recheck the source stamp before granting a transport permit.
+                // The existing upload loop hashes every byte and refuses asset
+                // completion if it differs from this exact prepared identity.
+                PreparedSource::read_expected(path, source.source())?;
+                BoundSource::open_for_upload(path, identity.file_bytes)
             }
         }
     }
@@ -148,8 +152,10 @@ impl Audio {
                 metadata: metadata::read(path)?,
             });
         }
-        let source =
-            PreparedSource::read_expected(path, &music_protocol::media::mpeg::read(path)?)?;
+        let source = PreparedSource::read_expected(
+            path,
+            &crate::engine::planning::source_reads::mpeg(path)?,
+        )?;
         ensure!(
             source.identity() == sent,
             "it changed since the batch was sent"
@@ -210,7 +216,19 @@ pub(crate) fn members(
     use crate::engine::planning::additive::Decision;
     let mut members = Vec::new();
     let mut others = 0;
-    for row in &checked.plan.sources {
+    let mut last = std::time::Instant::now();
+    let total = checked.plan.sources.len();
+    for (index, row) in checked.plan.sources.iter().enumerate() {
+        ensure!(
+            !crate::engine::cancellation().load(std::sync::atomic::Ordering::Relaxed),
+            "transfer preparation cancelled"
+        );
+        if index == 0 || last.elapsed().as_millis() >= 200 {
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::PreparingTransferAssets { done: index, total },
+            ))?;
+            last = std::time::Instant::now();
+        }
         // A skipped source is left out, whatever else it describes.
         if matches!(row.decision, Decision::Skip { .. }) {
             continue;
@@ -300,6 +318,9 @@ pub(crate) fn members(
             _ => others += 1,
         }
     }
+    crate::engine::observe(crate::engine::Event::Observation(
+        crate::engine::Observation::PreparingTransferAssets { done: total, total },
+    ))?;
     let scope = crate::engine::planning::removal::collection_scope_sha256(&checked.sources)?;
     Ok(Batchable {
         members,
@@ -1862,25 +1883,10 @@ async fn settle_with(
         None => None,
     };
     let prior = projected.as_ref().unwrap_or(&before.catalog);
-    let catalogue = match window {
-        Window::SameRun => insert_verification::verify_insert_batch_covered(
-            prior,
-            &after.catalog,
-            &expected,
-            &locationless,
-            &removed_tracks,
-            &covers,
-        ),
-        Window::LaterRun => insert_verification::verify_insert_batch_after_listening(
-            prior,
-            &after.catalog,
-            &expected,
-            &locationless,
-            &removed_tracks,
-            &covers,
-            &between_runs::catalogue_listening,
-        ),
-    }
+    let catalogue = insert_verification::verify_insert_batch_after_listening(
+        prior,&after.catalog,&expected,&locationless,&removed_tracks,&covers,
+        &between_runs::catalogue_listening,
+    )
     .with_context(|| {
                 format!(
                     "the phone's catalogue is not the planned insertion; batch {} stays Started and {} keeps the after state",

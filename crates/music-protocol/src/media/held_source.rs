@@ -95,6 +95,32 @@ impl BoundSource {
         );
         Self::open_pinned(path, metadata, bytes, sha256)
     }
+    /// Pin a stable regular file for an upload that MUST compare its streamed
+    /// SHA-256 with the prepared identity before completing the native asset.
+    /// This method itself is not a claim that the content has been verified.
+    pub fn open_for_upload(path: &Path, bytes: u64) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() == bytes
+                && bytes > 0
+                && bytes <= MAX_AUDIO,
+            "upload source type/size differs from preparation"
+        );
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let source = Self {
+            file,
+            metadata,
+            path: path.to_owned(),
+        };
+        source.check()?;
+        Ok(source)
+    }
+
     fn open_pinned(
         path: &Path,
         metadata: fs::Metadata,

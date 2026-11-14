@@ -45,8 +45,13 @@ fn mpeg_keep_text_never_invents_missing_ownership() {
 fn playlist_push_uses_m3u8_directly_without_a_saved_plan() {
     assert!(matches!(
         Cli::try_parse_from([
-            "tool", "push", "tests/playlist-sync/playlist.m3u8", "--dry-run"
-        ]).unwrap().command,
+            "tool",
+            "push",
+            "tests/playlist-sync/playlist.m3u8",
+            "--dry-run"
+        ])
+        .unwrap()
+        .command,
         Command::Push {
             path: Some(_),
             playlist_name: None,
@@ -56,19 +61,30 @@ fn playlist_push_uses_m3u8_directly_without_a_saved_plan() {
     ));
     assert!(matches!(
         Cli::try_parse_from([
-            "tool", "push", "tests/playlist-sync/playlist.m3u8",
-            "--playlist-name", "Flurb Playlist Test",
-        ]).unwrap().command,
+            "tool",
+            "push",
+            "tests/playlist-sync/playlist.m3u8",
+            "--playlist-name",
+            "Flurb Playlist Test",
+        ])
+        .unwrap()
+        .command,
         Command::Push {
             playlist_name: Some(_),
             dry_run: false,
             ..
         }
     ));
-    assert!(Cli::try_parse_from([
-        "tool", "push", "tests/playlist-sync/playlist.m3u8",
-        "--from-plan", "plan.json"
-    ]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "tool",
+            "push",
+            "tests/playlist-sync/playlist.m3u8",
+            "--from-plan",
+            "plan.json"
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -78,7 +94,9 @@ fn list_cli_supports_summary_json_and_verbose_without_extra_subcommands() {
         Command::List { json: false }
     ));
     assert!(matches!(
-        Cli::try_parse_from(["tool", "list", "--json", "--verbose"]).unwrap().command,
+        Cli::try_parse_from(["tool", "list", "--json", "--verbose"])
+            .unwrap()
+            .command,
         Command::List { json: true }
     ));
     assert!(Cli::try_parse_from(["tool", "list", "tracks"]).is_err());

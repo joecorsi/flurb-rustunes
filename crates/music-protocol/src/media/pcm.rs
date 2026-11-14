@@ -1,7 +1,7 @@
 //! Optional decoded equality evidence for an already validated ALAC profile.
 //!
 //! No matching, ownership, allocation, or phone operation is implied.
-//! Linux `/proc/self/fd/0` gives FFmpeg the same opened, seekable, read-only file
+//! The platform’s seekable stdin descriptor gives FFmpeg the same opened, seekable, read-only file
 //! that was inspected and hashed. The caller supplies validated container timing;
 //! this module rechecks it and the profile on that handle before decoding.
 
@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::media::timing::{self, Timing};
 
-const MAX_FILE: u64 = 512 * 1024 * 1024;
+const MAX_FILE: u64 = crate::protocol::transfer::MAX_AUDIO;
 const DEADLINE: Duration = Duration::from_secs(120);
 const TERMINATION_RESERVE: Duration = Duration::from_secs(2);
 const MAX_LOG: usize = 64 * 1024;
@@ -111,7 +111,7 @@ pub fn read(path: &Path, expected: &Timing) -> Result<DecodedFingerprint> {
             "-f",
             "mov",
             "-i",
-            "/proc/self/fd/0",
+            crate::media::ffmpeg::SEEKABLE_STDIN,
             "-map",
             "0:a:0",
             "-vn",

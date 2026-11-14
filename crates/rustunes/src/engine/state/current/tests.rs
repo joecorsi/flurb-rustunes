@@ -375,6 +375,10 @@ async fn parent_or_attempt_swap_cannot_redirect_writes_or_publish() {
                 let parent = parent_copy.clone();
                 let base = base.clone();
                 async move {
+                    // Retain the callback's directory before changing its name.
+                    // macOS has no traversable /proc FD alias; resolve the same
+                    // held directory after the deliberate rename, never its replacement.
+                    let held = File::open(&path)?;
                     if parent_swap {
                         fs::rename(&parent, base.join("held-parent"))?;
                         fs::create_dir(&parent)?;
@@ -384,7 +388,8 @@ async fn parent_or_attempt_swap_cannot_redirect_writes_or_publish() {
                         fs::create_dir(base.join("outside"))?;
                         symlink(base.join("outside"), &slot)?;
                     }
-                    let hash = files(&path, 1)?;
+                    let anchored = fd_path(&held)?;
+                    let hash = files(&anchored, 1)?;
                     Ok(((), hash))
                 }
             },

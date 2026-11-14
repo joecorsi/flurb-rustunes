@@ -217,7 +217,13 @@ pub fn unprojected_frames(source: &Source) -> BTreeSet<&str> {
 /// field more than once has to be edited to keep one. An empty value counts
 /// for none (`metadata::tag_value`).
 fn text(values: &[String], field: &str, required: bool) -> Result<Option<String>> {
-    let values: Vec<_> = tag_values(values).collect();
+    let mut unique = Vec::new();
+    for value in tag_values(values) {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    let values = unique;
     ensure!(
         values.len() <= 1,
         "{field} has {} values in the file's tag; edit the tag to keep one",
@@ -281,7 +287,50 @@ fn numbering(number: Option<u32>, total: Option<u32>, field: &str) -> Result<()>
 /// repeated field, and every repeated field of another format, is refused.
 /// An empty value is no value.
 pub fn project(source: &Source) -> Result<Metadata> {
+    if source.stream.is_none() {
+        // Catalogue conventions are independent of the bytes retained in the
+        // source file. Optional numbering and repeated descriptive fields are
+        // not evidence of damaged audio.
+        let mut tags = source.metadata.clone();
+        normalize_sync_tags(&mut tags)?;
+        if tag_values(&tags.title).next().is_none()
+            && let Some(title) = &source.fallback_title
+        {
+            tags.title = vec![title.clone()];
+        }
+        if tag_values(&tags.artist).next().is_none() {
+            tags.artist = vec!["Unknown Artist".into()];
+        }
+        return project_tags(&tags, false);
+    }
     project_tags(&source.metadata, source.format() == Format::Flac)
+}
+
+fn normalize_sync_tags(tags: &mut Tags) -> Result<()> {
+    for (number, total) in [
+        (&mut tags.track, &mut tags.track_total),
+        (&mut tags.disc, &mut tags.disc_total),
+    ] {
+        *number = number.filter(|n| *n > 0);
+        *total = total.filter(|n| *n > 0);
+        if number.is_none() || number.zip(*total).is_some_and(|(n, t)| n > t) {
+            *total = None;
+        }
+    }
+    tags.genre = joined(&tags.genre, "genre")?;
+    // An iPhone catalogue has one year. Use the first valid tagged year;
+    // preserve every original date in the unmodified file.
+    let dates = tag_values(&tags.release_date)
+        .find(|v| {
+            v.len() >= 4
+                && v.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+                && &v[..4] != "0000"
+                && (v.len() == 4 || v.as_bytes()[4] == b'-')
+        })
+        .map(|v| vec![v.to_owned()])
+        .unwrap_or_default();
+    tags.release_date = dates;
+    Ok(())
 }
 
 fn project_tags(tags: &Tags, flac: bool) -> Result<Metadata> {
@@ -301,13 +350,25 @@ fn project_tags(tags: &Tags, flac: bool) -> Result<Metadata> {
             Ok(year)
         })
         .transpose()?;
-    let genre = text(&tags.genre, "genre", false)?;
-    if let Some(genre) = &genre {
-        ensure!(
-            !genre.bytes().all(|b| b.is_ascii_digit()) && !genre.starts_with('('),
-            "numeric ID3 genres require an explicit label mapping"
-        );
-    }
+    let genre = text(&tags.genre, "genre", false)?
+        .map(|value| {
+            let numeric = value
+                .strip_prefix('(')
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(&value);
+            if !numeric.is_empty() && numeric.bytes().all(|b| b.is_ascii_digit()) {
+                let index = numeric
+                    .parse::<usize>()
+                    .context("invalid numeric ID3 genre")?;
+                Ok(lofty::id3::v1::GENRES
+                    .get(index)
+                    .context("unrecognized numeric ID3 genre")?
+                    .to_string())
+            } else {
+                Ok::<_, anyhow::Error>(value)
+            }
+        })
+        .transpose()?;
     let (artist, sort_artist, composer, sort_composer) = if flac {
         (
             joined(&tags.artist, "artist")?,
@@ -333,8 +394,9 @@ fn project_tags(tags: &Tags, flac: bool) -> Result<Metadata> {
         sort_composer: text(&sort_composer, "sort composer", false)?,
         title: text(&tags.title, "title", true)?.context("missing title")?,
         artist: text(&artist, "artist", true)?.context("missing artist")?,
-        album: text(&tags.album, "album", true)?.context("missing album")?,
-        album_artist: text(&tags.album_artist, "album artist", false)?,
+        album: text(&tags.album, "album", false)?.unwrap_or_else(|| "Unknown Album".into()),
+        album_artist: text(&tags.album_artist, "album artist", false)?
+            .or_else(|| (tags.compilation == Some(true)).then(|| "Various Artists".into())),
         genre,
         composer: text(&composer, "composer", false)?,
         copyright: text(&tags.copyright, "copyright", false)?,
@@ -513,6 +575,28 @@ mod tests {
     ) -> Result<(Option<String>, Option<String>)> {
         let m = project_tags(&tags(composer, sort), flac)?;
         Ok((m.composer, m.sort_composer))
+    }
+
+    #[test]
+    fn absent_album_and_standard_numeric_genres_project_without_changing_source_tags() {
+        let mut source = Tags {
+            title: vec!["Song".into()],
+            artist: vec!["Artist".into()],
+            genre: vec!["(17)".into()],
+            ..Default::default()
+        };
+        let metadata = project_tags(&source, false).unwrap();
+        assert_eq!(metadata.album, "Unknown Album");
+        assert_eq!(metadata.genre.as_deref(), Some("Rock"));
+        assert!(source.album.is_empty());
+        assert_eq!(source.genre, ["(17)"]);
+        source.release_date = vec!["1985".into(), "1985".into()];
+        assert_eq!(project_tags(&source, false).unwrap().year, Some(1985));
+        source.release_date.push("1986".into());
+        assert!(project_tags(&source, false).is_err());
+        source.release_date.clear();
+        source.genre = vec!["9999".into()];
+        assert!(project_tags(&source, false).is_err());
     }
 
     #[test]
@@ -837,5 +921,36 @@ mod tests {
             project(&source).unwrap_err().to_string(),
             "title has 2 values in the file's tag; edit the tag to keep one"
         );
+    }
+}
+
+#[cfg(test)]
+mod sync_conventions_tests {
+    use super::*;
+    #[test]
+    fn optional_tags_do_not_block_valid_audio_or_mutate_original_tags() {
+        let original = Tags {
+            title: vec!["Song".into()],
+            artist: vec!["Artist".into()],
+            track: Some(3),
+            track_total: Some(0),
+            genre: vec!["Soul".into(), "Funk".into()],
+            release_date: vec!["1985".into(), "1986".into()],
+            ..Default::default()
+        };
+        let mut projected = original.clone();
+        normalize_sync_tags(&mut projected).unwrap();
+        let metadata = project_tags(&projected, false).unwrap();
+        assert_eq!(metadata.track, Some(3));
+        assert_eq!(metadata.track_total, None);
+        assert_eq!(metadata.genre.as_deref(), Some("Soul, Funk"));
+        assert_eq!(metadata.year, Some(1985));
+        assert_eq!(original.track_total, Some(0));
+        assert_eq!(original.genre.len(), 2);
+        projected.track = Some(0);
+        projected.track_total = Some(20);
+        normalize_sync_tags(&mut projected).unwrap();
+        assert_eq!(project_tags(&projected, false).unwrap().track, None);
+        assert_eq!(projected.track_total, None);
     }
 }

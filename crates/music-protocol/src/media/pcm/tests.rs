@@ -160,7 +160,7 @@ fn validated_timing_actual_profile_and_source_shape_must_agree() {
     let oversized = temp.path("oversized.m4a");
     File::create(&oversized)
         .unwrap()
-        .set_len(MAX_FILE + 1)
+        .set_len(512 * 1024 * 1024 + 1)
         .unwrap();
     assert!(read(&oversized, &timing).is_err());
     let mono = temp.path("mono.m4a");

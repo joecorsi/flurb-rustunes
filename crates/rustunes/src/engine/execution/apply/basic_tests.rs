@@ -257,17 +257,11 @@ fn alac_retention_expired_or_cancelled_control_refuses_without_copy() {
 }
 
 #[test]
-fn alac_retention_existing_native_size_bound_refuses_before_reading() {
+fn alac_retention_inconsistent_source_size_refuses_before_reading() {
     let f = RetainedAlacFixture::new("size-bound");
     let original = f.original();
     let mut expected = music_protocol::media::fingerprint::read(&original).unwrap();
     expected.file_bytes = music_protocol::protocol::transfer::MAX_AUDIO + 1;
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&original)
-        .unwrap()
-        .set_len(expected.file_bytes)
-        .unwrap();
     let step = f.step();
     let error = retain_alac_source(&original, &expected, &step, &retention_control()).unwrap_err();
     assert!(error.to_string().contains("source type/size differs"));

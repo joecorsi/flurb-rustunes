@@ -168,6 +168,25 @@ pub(crate) async fn capture_fresh(
     capture(directory, None, Absent::NONE, control).await
 }
 
+/// Discovery for interrupted-operation recovery only. The caller must settle
+/// the journal's operation, or reject every missing/unfilled row before work.
+pub(crate) async fn capture_for_reconciliation(
+    directory: &Path,
+    control: &Control,
+) -> Result<(Identity, Before)> {
+    capture(
+        directory,
+        None,
+        Absent {
+            any_unfilled: true,
+            gone: true,
+            ..Absent::NONE
+        },
+        control,
+    )
+    .await
+}
+
 /// Rows without audio that `absent` allows are accepted; every other track
 /// must hold its audio.
 async fn capture(

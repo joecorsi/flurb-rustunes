@@ -38,7 +38,7 @@ pub struct FixtureDirectory(pub PathBuf);
 impl FixtureDirectory {
     fn new() -> Self {
         for _ in 0..32 {
-            let path = std::env::temp_dir().join(format!(
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "catalogue-fixture-{}-{}",
                 std::process::id(),
                 FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -296,7 +296,7 @@ impl NativeFixture {
         Self::build(2_410_000, Some(INDEX_ONLY_UPDATE))
     }
     fn build(version: i64, index: Option<[&str; 4]>) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "delete-sql-test-{}-{}",
             std::process::id(),
             NATIVE_SEQUENCE.fetch_add(1, Ordering::Relaxed)

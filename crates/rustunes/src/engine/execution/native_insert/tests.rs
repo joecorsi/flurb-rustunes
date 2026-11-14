@@ -1,6 +1,7 @@
 use super::*;
 use crate::engine::state::journal::{self, AttemptState};
 use music_protocol::catalogue::identity;
+use music_protocol::protocol::transfer::MAX_BOUNDED_OPS;
 use std::{sync::atomic::AtomicU64, time::SystemTime};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -284,7 +285,7 @@ fn derived_budget_covers_bounded_worst_case_without_expansion() {
             sha256: [4; 32],
         }),
     ];
-    assert_eq!(operation_budget(&current, MAX_AUDIO).unwrap(), 7744);
+    assert_eq!(operation_budget(&current, 64 * 1024 * 1024).unwrap(), 7744);
     assert!(operation_budget(&current, MAX_AUDIO + 1).is_err());
     assert!(operation_budget(&state(), 936).unwrap() < 1024);
 }
@@ -400,7 +401,7 @@ fn bound_cdb_validates_identity_voice_and_contributes_both_guard_reads_to_budget
         bytes: MAX_CATALOG,
         sha256: [5; 32],
     });
-    assert!(operation_budget(&current, MAX_AUDIO).is_err()); // >8192, never expanded.
+    assert!(operation_budget(&current, 1024 * 1024 * 1024).is_ok()); // Derived from the actual streamed audio size.
 }
 
 #[test]

@@ -454,7 +454,6 @@ fn operation_budget(state_chunks: u64, artwork_db: u64, audio: u64, cover: u64) 
     let operations = state_chunks
         .checked_mul(2)
         .and_then(|n| n.checked_add(artwork_db.div_ceil(CHUNK) * 2))
-        .and_then(|n| n.checked_add(audio.div_ceil(CHUNK) * 3))
         .and_then(|n| n.checked_add(cover.div_ceil(CHUNK) * 2))
         .and_then(|n| n.checked_add(512))
         .context("artwork operation budget overflow")?;
@@ -463,7 +462,10 @@ fn operation_budget(state_chunks: u64, artwork_db: u64, audio: u64, cover: u64) 
         operations <= MAX_BOUNDED_OPS,
         "derived artwork AFC allowance exceeds bound"
     );
-    Ok(operations)
+    let operations = (operations as u64)
+        .checked_add(audio.div_ceil(CHUNK) * 3)
+        .context("audio readback allowance overflow")?;
+    Ok(usize::try_from(operations)?)
 }
 
 async fn preflight(

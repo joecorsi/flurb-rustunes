@@ -16,7 +16,7 @@ const BITRATES: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128,
 /// 2.5 Layer III frame.
 pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<Option<Layout>> {
     let mut tags = Vec::new();
-    let start = match id3v2_length(input, size)? {
+    let tag_end = match id3v2_length(input, size)? {
         Some(length) => {
             tags.push(TagRegion {
                 kind: TagKind::Id3v2,
@@ -27,19 +27,19 @@ pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<Option<Layou
         }
         None => 0,
     };
-    let mut end = size;
-    if size >= 128 + start {
+    let start = crate::media::mpeg_layout::after_id3_padding(input, tag_end, size)?;
+    let end = crate::media::mpeg_layout::audio_end(input, start, size)?;
+    if size >= 128 && {
         input.seek(SeekFrom::Start(size - 128))?;
         let mut marker = [0; 3];
         input.read_exact(&mut marker)?;
-        if &marker == b"TAG" {
-            end -= 128;
-            tags.push(TagRegion {
-                kind: TagKind::Id3v1,
-                offset: end,
-                bytes: 128,
-            });
-        }
+        marker == *b"TAG"
+    } {
+        tags.push(TagRegion {
+            kind: TagKind::Id3v1,
+            offset: size - 128,
+            bytes: 128,
+        });
     }
     let Some(first) = header_at(input, start, end)? else {
         return Ok(None);
@@ -50,9 +50,13 @@ pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<Option<Layou
     let mut kbps = Vec::new();
     while offset < end {
         ensure!(frames < 4_000_000, "MPEG frame count bound");
-        let header = header_at(input, offset, end)?
-            .filter(|h| h.length <= end - offset)
-            .ok_or_else(|| anyhow::anyhow!("MPEG frame {frames} is damaged or truncated"))?;
+        let header = header_at(input, offset, end)?.filter(|h| h.length <= end - offset);
+        let Some(header) = header else {
+            if frames >= 3 && crate::media::mpeg_layout::after_zeros(input, offset, end)? == end {
+                break;
+            }
+            anyhow::bail!("MPEG frame {frames} is damaged or truncated");
+        };
         ensure!(
             header.shape == first.shape,
             "MPEG stream changes version, sample rate or channel count"
@@ -63,7 +67,7 @@ pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<Option<Layou
     }
     ensure!(frames >= 2, "MPEG stream has fewer than two frames");
     let sample_rate = first.sample_rate;
-    let audio_bytes = end - start;
+    let audio_bytes = offset - start;
     let coded_samples = frames * 576;
     let constant = kbps.iter().all(|k| *k == kbps[0]);
     let encoded = EncodedAudio {
@@ -155,7 +159,7 @@ pub(crate) fn id3v2_length(input: &mut (impl Read + Seek), size: u64) -> Result<
         return Ok(None);
     }
     ensure!(
-        matches!(first[3], 3 | 4) && first[4] == 0 && first[6..].iter().all(|b| b & 0x80 == 0),
+        matches!(first[3], 2 | 3 | 4) && first[4] == 0 && first[6..].iter().all(|b| b & 0x80 == 0),
         "unsupported ID3 header"
     );
     let tag = first[6..]
@@ -184,6 +188,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tagged_lower_rate_audio_allows_space_padding_without_changing_audio_identity() {
+        let audio = mpeg2(4);
+        let original = inspect(&mut Cursor::new(&audio), audio.len() as u64)
+            .unwrap()
+            .unwrap();
+        let mut bytes = b"ID3\x03\0\0\0\0\0\0    ".to_vec();
+        bytes.extend(&audio);
+        let padded = inspect(&mut Cursor::new(&bytes), bytes.len() as u64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(padded.encoded.sha256(), original.encoded.sha256());
+        assert_eq!(padded.encoded.audio_offset, 14);
+    }
+
+    #[test]
     fn reads_mpeg2_frames_and_leaves_mpeg1_alone() {
         let bytes = mpeg2(10);
         let layout = inspect(&mut Cursor::new(&bytes), bytes.len() as u64)
@@ -206,6 +225,30 @@ pub(crate) mod tests {
         mpeg1[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
         let mpeg1 = mpeg1.repeat(3);
         assert!(inspect(&mut Cursor::new(&mpeg1), 1251).unwrap().is_none());
+    }
+
+    #[test]
+    fn lower_rate_mp3_uses_the_same_padding_and_trailing_tag_rules() {
+        let original = mpeg2(10);
+        let base = inspect(&mut Cursor::new(&original), original.len() as u64)
+            .unwrap()
+            .unwrap();
+        let mut bytes = b"ID3\x04\0\0\0\0\0\0".to_vec();
+        bytes.resize(bytes.len() + 1044, 0);
+        bytes.extend(&original);
+        bytes.extend(b"LYRICSBEGIN000011LYRICS200");
+        bytes.extend(crate::media::ape::tests::tag(true, 5));
+        let result = inspect(&mut Cursor::new(&bytes), bytes.len() as u64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.encoded.sha256(), base.encoded.sha256());
+        assert_eq!(result.encoded.audio_offset, 1054);
+        bytes[100] = 42;
+        assert!(
+            inspect(&mut Cursor::new(&bytes), bytes.len() as u64)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

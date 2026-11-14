@@ -100,14 +100,118 @@ pub fn delete_playlists(
 /// the receiver's container and exact ordered members after sending.
 ///
 /// Member identities are sync IDs (the wire PIDs in item_store), never SQLite
-/// item row IDs. The first integration is deliberately limited to nonempty
-/// ordinary playlists with unique existing local music tracks.
+/// item row IDs. Ordinary playlists may be empty; any members must be unique
+/// existing local music tracks.
 pub fn insert_playlist(
     catalog: &Catalog,
     playlist_pid: u64,
     name: &str,
     ordered_track_sync_ids: &[u64],
     timestamp: SystemTime,
+) -> Result<Vec<u8>> {
+    playlist_operation(
+        catalog,
+        playlist_pid,
+        name,
+        ordered_track_sync_ids,
+        timestamp,
+        false,
+    )
+}
+
+/// Replace the complete ordered membership/name of an existing ordinary
+/// playlist. No deletion/recreation, track operations or UI reset is emitted.
+/// The caller must independently qualify ownership from fresh raw SQL and
+/// verify the result; serialization grants no write authority.
+pub fn update_playlist(
+    catalog: &Catalog,
+    playlist_pid: u64,
+    name: &str,
+    ordered_track_sync_ids: &[u64],
+    timestamp: SystemTime,
+) -> Result<Vec<u8>> {
+    playlist_operation(
+        catalog,
+        playlist_pid,
+        name,
+        ordered_track_sync_ids,
+        timestamp,
+        true,
+    )
+}
+
+/// Ordinary playlist changes sharing one revision and native session.
+pub enum PlaylistMutation<'a> {
+    Insert {
+        pid: u64,
+        name: &'a str,
+        tracks: &'a [u64],
+    },
+    Update {
+        pid: u64,
+        name: &'a str,
+        tracks: &'a [u64],
+    },
+    Delete {
+        pid: u64,
+    },
+}
+pub fn change_playlists(
+    catalog: &Catalog,
+    changes: &[PlaylistMutation<'_>],
+    timestamp: SystemTime,
+) -> Result<Vec<u8>> {
+    ensure!(
+        !changes.is_empty() && changes.len() <= 64,
+        "a playlist batch must contain 1..=64 changes"
+    );
+    let identity = catalog_identity(catalog);
+    let mut operations = vec![db_info_update(&identity)];
+    let mut ids = std::collections::BTreeSet::new();
+    for change in changes {
+        let (pid, bytes) = match change {
+            PlaylistMutation::Insert { pid, name, tracks } => (
+                *pid,
+                insert_playlist(catalog, *pid, name, tracks, timestamp)?,
+            ),
+            PlaylistMutation::Update { pid, name, tracks } => (
+                *pid,
+                update_playlist(catalog, *pid, name, tracks, timestamp)?,
+            ),
+            PlaylistMutation::Delete { pid } => {
+                (*pid, delete_playlists(catalog, &[*pid], timestamp)?)
+            }
+        };
+        ensure!(ids.insert(pid), "duplicate playlist identity in batch");
+        let value = Value::from_reader(std::io::Cursor::new(bytes))?;
+        let ops = value.as_dictionary().context("playlist envelope absent")?["operations"]
+            .as_array()
+            .context("playlist operations absent")?;
+        ensure!(ops.len() == 2, "unexpected playlist operation shape");
+        operations.push(ops[1].clone());
+    }
+    let bytes = envelope(
+        identity
+            .anchor
+            .checked_add(1)
+            .context("Media anchor exhausted")?,
+        timestamp,
+        operations,
+    )?;
+    ensure!(
+        bytes.len() <= 1024 * 1024,
+        "playlist batch exceeds native metadata bound"
+    );
+    Ok(bytes)
+}
+
+fn playlist_operation(
+    catalog: &Catalog,
+    playlist_pid: u64,
+    name: &str,
+    ordered_track_sync_ids: &[u64],
+    timestamp: SystemTime,
+    update: bool,
 ) -> Result<Vec<u8>> {
     let identity = catalog_identity(catalog);
     ensure!(
@@ -121,14 +225,12 @@ pub fn insert_playlist(
         "playlist PID is zero or a reserved library identifier"
     );
     ensure!(
-        !name.trim().is_empty()
-            && name.len() <= 255
-            && !name.chars().any(char::is_control),
+        !name.trim().is_empty() && name.len() <= 255 && !name.chars().any(char::is_control),
         "playlist name must be nonempty, at most 255 bytes, without control characters"
     );
     ensure!(
-        !ordered_track_sync_ids.is_empty() && ordered_track_sync_ids.len() <= 499,
-        "initial test playlist must contain 1..=499 tracks"
+        ordered_track_sync_ids.len() <= 499,
+        "a playlist must contain at most 499 tracks"
     );
     let mut members = Vec::with_capacity(ordered_track_sync_ids.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -144,7 +246,9 @@ pub fn insert_playlist(
 
     let mut container = Dictionary::new();
     container.insert("name".into(), name.into());
-    container.insert("date_created".into(), Value::Date(timestamp.into()));
+    if !update {
+        container.insert("date_created".into(), Value::Date(timestamp.into()));
+    }
     container.insert("date_modified".into(), Value::Date(timestamp.into()));
     let mut ui = Dictionary::new();
     ui.insert("play_order".into(), 1.into());
@@ -155,10 +259,20 @@ pub fn insert_playlist(
     ui.insert("has_been_shuffled".into(), false.into());
 
     let mut operation = Dictionary::new();
-    operation.insert("operation".into(), "insert_playlist".into());
+    operation.insert(
+        "operation".into(),
+        if update {
+            "update_playlist"
+        } else {
+            "insert_playlist"
+        }
+        .into(),
+    );
     operation.insert("pid".into(), (playlist_pid as i64).into());
     operation.insert("container".into(), Value::Dictionary(container));
-    operation.insert("container_ui".into(), Value::Dictionary(ui));
+    if !update {
+        operation.insert("container_ui".into(), Value::Dictionary(ui));
+    }
     operation.insert("item_to_container".into(), Value::Array(members));
     let revision = identity
         .anchor
@@ -540,7 +654,11 @@ mod tests {
         assert_eq!(
             keys(op),
             BTreeSet::from([
-                "operation", "pid", "container", "container_ui", "item_to_container"
+                "operation",
+                "pid",
+                "container",
+                "container_ui",
+                "item_to_container"
             ])
         );
         assert_eq!(op["operation"].as_string(), Some("insert_playlist"));
@@ -557,8 +675,12 @@ mod tests {
         assert_eq!(
             keys(ui),
             BTreeSet::from([
-                "play_order", "album_field_order", "repeat_mode",
-                "is_reversed", "shuffle_items", "has_been_shuffled"
+                "play_order",
+                "album_field_order",
+                "repeat_mode",
+                "is_reversed",
+                "shuffle_items",
+                "has_been_shuffled"
             ])
         );
         assert_eq!(ui["play_order"].as_signed_integer(), Some(1));
@@ -571,6 +693,126 @@ mod tests {
     }
 
     #[test]
+    fn playlist_batch_uses_one_revision_and_rejects_duplicate_or_excess_targets() {
+        let catalog = crate::test_support::catalogue::collection_catalog(40);
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let track = catalog.tracks()[0].sync_id;
+        let ids = [track];
+        let changes = [
+            PlaylistMutation::Insert {
+                pid: 5001,
+                name: "New",
+                tracks: &[],
+            },
+            PlaylistMutation::Update {
+                pid: 5002,
+                name: "Updated",
+                tracks: &ids,
+            },
+            PlaylistMutation::Delete { pid: 5003 },
+        ];
+        let bytes = change_playlists(&catalog, &changes, time).unwrap();
+        let root = Value::from_reader(Cursor::new(bytes)).unwrap();
+        let env = root.as_dictionary().unwrap();
+        assert_eq!(env["revision"].as_unsigned_integer(), Some(41));
+        let ops = env["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 4);
+        let names: Vec<_> = ops
+            .iter()
+            .map(|o| o.as_dictionary().unwrap()["operation"].as_string().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "update_db_info",
+                "insert_playlist",
+                "update_playlist",
+                "delete_playlist"
+            ]
+        );
+        assert!(change_playlists(&catalog, &[], time).is_err());
+        let duplicate = [
+            PlaylistMutation::Insert {
+                pid: 5001,
+                name: "One",
+                tracks: &[],
+            },
+            PlaylistMutation::Delete { pid: 5001 },
+        ];
+        assert!(change_playlists(&catalog, &duplicate, time).is_err());
+        let many: Vec<_> = (0..65)
+            .map(|i| PlaylistMutation::Insert {
+                pid: 5000 + i,
+                name: "New",
+                tracks: &[],
+            })
+            .collect();
+        assert!(change_playlists(&catalog, &many[..64], time).is_ok());
+        assert!(change_playlists(&catalog, &many, time).is_err());
+    }
+
+    #[test]
+    fn insert_empty_playlist_keeps_its_identity_name_dates_and_empty_membership() {
+        let catalog = crate::test_support::catalogue::collection_catalog(40);
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let pid = 0x8000_0000_0000_0042u64;
+        let bytes = insert_playlist(&catalog, pid, "Empty playlist", &[], time).unwrap();
+        let root = Value::from_reader(Cursor::new(&bytes)).unwrap();
+        let env = root.as_dictionary().unwrap();
+        let ops = env["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        let op = ops[1].as_dictionary().unwrap();
+        assert_eq!(op["operation"].as_string(), Some("insert_playlist"));
+        assert_eq!(op["pid"].as_signed_integer(), Some(pid as i64));
+        assert!(op["item_to_container"].as_array().unwrap().is_empty());
+        let container = op["container"].as_dictionary().unwrap();
+        assert_eq!(container["name"].as_string(), Some("Empty playlist"));
+        assert_eq!(container["date_created"].as_date(), Some(time.into()));
+        assert_eq!(container["date_modified"].as_date(), Some(time.into()));
+    }
+
+    #[test]
+    fn playlist_update_replaces_order_and_allows_empty_without_resetting_identity_or_ui() {
+        let catalog = crate::test_support::catalogue::collection_catalog(40);
+        let id = catalog.tracks()[0].sync_id;
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        for ids in [vec![id], vec![]] {
+            let bytes = update_playlist(&catalog, 1234, "Renamed", &ids, time).unwrap();
+            let root = Value::from_reader(Cursor::new(&bytes)).unwrap();
+            let env = root.as_dictionary().unwrap();
+            assert_eq!(env["revision"].as_unsigned_integer(), Some(41));
+            let ops = env["operations"].as_array().unwrap();
+            assert_eq!(ops.len(), 2);
+            let op = ops[1].as_dictionary().unwrap();
+            assert_eq!(
+                keys(op),
+                BTreeSet::from(["operation", "pid", "container", "item_to_container"])
+            );
+            assert_eq!(op["operation"].as_string(), Some("update_playlist"));
+            assert_eq!(op["pid"].as_signed_integer(), Some(1234));
+            let container = op["container"].as_dictionary().unwrap();
+            assert_eq!(keys(container), BTreeSet::from(["name", "date_modified"]));
+            assert_eq!(container["name"].as_string(), Some("Renamed"));
+            let members = op["item_to_container"].as_array().unwrap();
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|v| v.as_signed_integer().unwrap() as u64)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+        }
+        for (pid, ids) in [
+            (0, vec![id]),
+            (catalog.primary_container_pid(), vec![id]),
+            (1234, vec![id, id]),
+            (1234, vec![987654]),
+        ] {
+            assert!(update_playlist(&catalog, pid, "Test", &ids, time).is_err());
+        }
+    }
+
+    #[test]
     fn insert_playlist_refuses_unidentified_or_invalid_members() {
         let catalog = crate::test_support::catalogue::collection_catalog(40);
         let id = catalog.tracks()[0].sync_id;
@@ -580,8 +822,7 @@ mod tests {
             (catalog.primary_container_pid(), "Test", vec![id]),
             (1234, "", vec![id]),
             (1234, "Line\nBreak", vec![id]),
-            (1234, "Test", vec![]),
-            (1234, "Test", vec![id,id]),
+            (1234, "Test", vec![id, id]),
             (1234, "Test", vec![0]),
             (1234, "Test", vec![123456]),
         ] {

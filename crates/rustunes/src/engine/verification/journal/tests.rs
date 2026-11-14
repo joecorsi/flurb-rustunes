@@ -182,10 +182,10 @@ impl ReadBatch for Mock {
 
 #[test]
 fn schedule_bounds_every_connection_and_counts_state_bytes_toward_total() {
-    let files: Vec<_> = (0..512).map(|i| (i, MAX_AUDIO)).collect();
+    let files: Vec<_> = (0..512).map(|i| (i, 64 * 1024 * 1024)).collect();
     let (batches, audio, total) = schedule(&files, 10).unwrap();
     assert!(batches.len() > 1);
-    assert_eq!(audio, 512 * MAX_AUDIO);
+    assert_eq!(audio, 512 * 64 * 1024 * 1024);
     assert!(total > audio);
     assert!(total <= MAX_TOTAL);
     assert!(
@@ -200,10 +200,16 @@ fn schedule_bounds_every_connection_and_counts_state_bytes_toward_total() {
             .collect::<Vec<_>>(),
         (0..512).collect::<Vec<_>>()
     );
-    assert!(schedule(&(0..1024).map(|i| (i, MAX_AUDIO)).collect::<Vec<_>>(), 10).is_err());
+    assert!(
+        schedule(
+            &(0..1024).map(|i| (i, 64 * 1024 * 1024)).collect::<Vec<_>>(),
+            10
+        )
+        .is_err()
+    );
     assert!(schedule(&[(0, MAX_AUDIO + 1)], 10).is_err());
     assert!(schedule(&[(0, 1)], u64::MAX).is_err());
-    assert!(schedule(&[(0, MAX_AUDIO)], 4000).is_err());
+    assert!(schedule(&[(0, 64 * 1024 * 1024)], 4000).is_ok());
     assert!(schedule(&vec![(0, 1); 4097], 0).is_err());
     assert!(schedule(&[], 0).unwrap().0.is_empty());
     // A library of 400 typical tracks needs two connections, not seventeen.

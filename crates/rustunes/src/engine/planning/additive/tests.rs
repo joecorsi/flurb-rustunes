@@ -1001,7 +1001,7 @@ fn inspected_audio_above_transfer_cap_is_refused_before_allocating_any_planned_r
     let folders = BTreeSet::from(["iTunes_Control/Music/F39".into()]);
     let mut paths = BTreeSet::new();
     let original = source.tracks[0].fingerprint.file_bytes;
-    source.tracks[0].fingerprint.file_bytes = 64 * 1024 * 1024 + 1;
+    source.tracks[0].fingerprint.file_bytes = music_protocol::protocol::transfer::MAX_AUDIO + 1;
     assert!(
         plan_add(
             &mut planner,
@@ -1456,17 +1456,20 @@ fn mp3_exact_match_is_unowned_keep_and_new_or_changed_bytes_never_allocate() {
     )
     .unwrap();
     assert!(
-        matches!(&plan.sources[0].decision,Decision::Skip{code,..}if *code=="mp3_source_profile_unsupported")
+        matches!(&plan.sources[0].decision,Decision::Conflict{code,..}if *code=="mp3_journal_required"),
+        "{}",
+        serde_json::to_string(&plan.sources[0].decision).unwrap()
     );
     let compatibility = plan.sources[0].mp3_insertion.as_ref().unwrap();
     assert!(!compatibility.execution_authorized);
     assert!(!compatibility.required_qualification.is_empty());
     assert!(
-        compatibility
+        !compatibility
             .compatibility_issues
             .iter()
             .any(|i| i.code == "mp3_metadata_policy_required")
     );
+    assert_eq!(compatibility.metadata.as_ref().unwrap().title, "source");
     let json = serde_json::to_value(&plan).unwrap();
     assert!(json["sources"][0].get("track_id").is_none());
     assert!(json["sources"][0].get("path").is_none());
@@ -1559,7 +1562,11 @@ fn uninsertable_sources_are_the_source_side_refusals() {
         .into_iter()
         .map(|(path, _)| path)
         .collect();
-    assert_eq!(refused, ["broken.m4a", "tagged.mp3"]);
+    assert_eq!(refused, ["broken.m4a"]);
+    assert_eq!(
+        sources.mp3_tracks[0].source.fallback_title.as_deref(),
+        Some("tagged")
+    );
     // Two sources with the same audio are both refused.
     fs::write(temp.0.join("copy.m4a"), &alac).unwrap();
     let sources = inspect(&select(&temp.0, &SelectionOptions::default()).unwrap()).unwrap();
@@ -1567,10 +1574,7 @@ fn uninsertable_sources_are_the_source_side_refusals() {
         .into_iter()
         .map(|(path, _)| path)
         .collect();
-    assert_eq!(
-        refused,
-        ["broken.m4a", "copy.m4a", "good.m4a", "tagged.mp3"]
-    );
+    assert_eq!(refused, ["broken.m4a", "copy.m4a", "good.m4a"]);
 }
 
 #[test]
@@ -2159,13 +2163,13 @@ fn owned_mp3_with_changed_tags_plans_an_update_of_its_fields_only() {
         "{}",
         serde_json::to_string(&unowned.sources[0].decision).unwrap()
     );
-    // Tags outside the insert-batch profile are not sent.
+    // Unrecognized numeric genre codes remain outside the insert-batch profile.
     let numeric = tagged_mp3(
         &[
             OWNED_TAGS[0],
             OWNED_TAGS[1],
             OWNED_TAGS[2],
-            ("TCON", "(17)"),
+            ("TCON", "(9999)"),
         ],
         &audio,
     );
@@ -2772,6 +2776,7 @@ fn a_refused_flac_is_left_out_and_the_rest_of_its_album_goes_together() {
     let (reason, message) = (reason.clone(), message.clone());
     let counts = plan.decision_counts();
     let result = crate::engine::PlanResult {
+        retained: None,
         add_only: false,
         serialized: serde_json::to_vec(&plan).unwrap(),
         additions: counts.additions,

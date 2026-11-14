@@ -16,7 +16,7 @@ pub mod mp4;
 pub mod mpeg;
 pub mod wav;
 
-pub(crate) const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = crate::protocol::transfer::MAX_AUDIO;
 /// Tag data a reader may hold in memory (pictures included).
 pub(crate) const MAX_TAG_BYTES: u64 = 16 * 1024 * 1024;
 

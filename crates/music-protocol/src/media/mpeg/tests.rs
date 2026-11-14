@@ -186,10 +186,10 @@ fn an_empty_numeric_frame_is_no_number() {
     let s = t.read(&tagged(vec![frame("TRCK", b"\x03\x005", 4)], 4));
     assert_eq!(s.unwrap().metadata.track, Some(5));
     let two = t.read(&tagged(vec![frame("TRCK", b"\x035\x006", 4)], 4));
-    assert_eq!(two.unwrap_err().to_string(), "ambiguous ID3 numeric frame");
+    assert!(format!("{:#}", two.unwrap_err()).contains("ambiguous ID3 numeric frame"));
 }
 #[test]
-fn malformed_flags_extents_utf16_duplicates_and_frames_refuse() {
+fn malformed_flags_extents_duplicates_and_audio_frames_refuse() {
     let t = Temp::new();
     let mut flags = tagged(vec![], 4);
     flags[5] = 0x80;
@@ -199,10 +199,9 @@ fn malformed_flags_extents_utf16_duplicates_and_frames_refuse() {
         vec![frame("TRCK", b"\x001", 4), frame("TRCK", b"\x002", 4)],
         4,
     );
-    let utf = tagged(vec![frame("TIT2", &[1, 0xff, 0xfe, 0], 4)], 4);
     let mut extent = tagged(vec![frame("TIT2", b"\x03A", 4)], 4);
     extent[17] = 127;
-    for bytes in [flags, broken, duplicate, utf, extent, vec![0; 834]] {
+    for bytes in [flags, broken, duplicate, extent, vec![0; 834]] {
         assert!(t.read(&bytes).is_err());
     }
 }
@@ -319,10 +318,19 @@ fn apic_reads_png_and_any_jpeg_kind_by_their_own_bytes() {
         let p = &read(mime, &picture(format)).unwrap().artwork[0];
         assert_eq!((p.mime, p.width, p.height), (format.mime(), 2, 1));
     }
-    // The declared type must agree with the bytes; other image types refuse.
-    assert!(read(b"image/jpeg", &png).is_err());
-    assert!(read(b"image/png", &progressive).is_err());
-    assert!(read(b"image/gif", &png).is_err());
+    // Valid bytes decide the format when a recognized MIME label is wrong.
+    assert_eq!(
+        read(b"image/jpeg", &png).unwrap().artwork[0].mime,
+        "image/png"
+    );
+    assert_eq!(
+        read(b"image/png", &progressive).unwrap().artwork[0].mime,
+        "image/jpeg"
+    );
+    assert_eq!(
+        read(b"image/gif", &png).unwrap().artwork[0].mime,
+        "image/png"
+    );
     let gif = format!("{:#}", read(b"image/gif", b"GIF89a").unwrap_err());
     assert!(gif.contains("reading a GIF header"), "{gif}");
     let webp = format!("{:#}", read(b"image/webp", &png).unwrap_err());
@@ -343,9 +351,17 @@ fn a_picture_declaring_no_type_is_read_by_its_bytes() {
         assert!(image_facts(mime, b"not a picture").is_err());
         assert!(image_facts(mime, b"").is_err());
     }
-    // A declared type that disagrees with the bytes still refuses.
-    assert!(image_facts(b"image/jpeg", &png).is_err());
-    assert!(image_facts(b"image/png", &jpeg).is_err());
+    // Broken taggers sometimes label JPEG bytes as PNG (or the reverse).
+    // Decode and validate the actual format without rewriting the source tag.
+    assert_eq!(
+        image_facts(b"image/jpeg", &png).unwrap(),
+        ("image/png", (5, 4))
+    );
+    assert_eq!(
+        image_facts(b"image/png", &jpeg).unwrap(),
+        ("image/jpeg", (3, 2))
+    );
+    assert!(image_facts(b"image/png", b"not a picture").is_err());
     assert!(image_facts(b"image/webp", &png).is_err());
     // An ID3v2.3 APIC frame may leave its type empty.
     let t = Temp::new();
@@ -362,4 +378,277 @@ fn symlink_source_is_not_read() {
     fs::write(t.0.join("target"), audio()).unwrap();
     std::os::unix::fs::symlink(t.0.join("target"), t.0.join("alias.mp3")).unwrap();
     assert!(read(&t.0.join("alias.mp3")).is_err());
+}
+
+#[test]
+fn legacy_v22_readonly_status_and_empty_frames_preserve_the_original_audio() {
+    let temp = Temp::new();
+    let mut old = Vec::new();
+    for (id, text) in [
+        ("TT2", "Legacy title"),
+        ("TP1", "Artist"),
+        ("TAL", "Album"),
+        ("TRK", "3"),
+    ] {
+        let payload = [b"\0".as_slice(), text.as_bytes()].concat();
+        old.extend_from_slice(id.as_bytes());
+        old.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        old.extend_from_slice(&payload);
+    }
+    let bytes = [b"ID3\x02\0\0".as_slice(), &safe(old.len()), &old, &audio()].concat();
+    let read = temp.read(&bytes).unwrap();
+    assert_eq!(read.metadata.title, ["Legacy title"]);
+    assert_eq!(read.metadata.album, ["Album"]);
+    assert_eq!(read.metadata.track, Some(3));
+    let mut readonly = frame("TIT2", b"\0Legacy title", 3);
+    readonly[8] = 0x40;
+    let empty = frame("MCDI", b"", 3);
+    let newer = temp.read(&tagged(vec![readonly, empty], 3)).unwrap();
+    assert_eq!(newer.metadata.title, read.metadata.title);
+    assert_eq!(
+        newer.fingerprint.audio.sha256,
+        read.fingerprint.audio.sha256
+    );
+}
+
+#[test]
+fn incomplete_final_frame_stays_in_the_file_identity_but_not_audio_timing() {
+    let temp = Temp::new();
+    let complete = [audio(), audio()].concat();
+    let original = temp.read(&complete).unwrap();
+    let bytes = [complete.as_slice(), &audio()[..200]].concat();
+    let partial = temp.read(&bytes).unwrap();
+    assert_eq!(partial.fingerprint.file_bytes, bytes.len() as u64);
+    assert_eq!(
+        partial.fingerprint.audio.sha256,
+        original.fingerprint.audio.sha256
+    );
+    assert_ne!(
+        partial.fingerprint.full_file_sha256,
+        original.fingerprint.full_file_sha256
+    );
+    assert_eq!(partial.trailing_tag_bytes, 200);
+    partial.transferred_identity().unwrap();
+}
+
+#[test]
+fn padding_and_tag_stacks_preserve_metadata_artwork_identity_and_source_bytes() {
+    let t = Temp::new();
+    let original = tagged(vec![frame("TIT2", b"\x03Track", 4)], 4);
+    let baseline = t.read(&original).unwrap();
+    for padding in [1044, 8193, 17 * 1024 * 1024] {
+        let tag_end = original.len() - audio().len();
+        let mut bytes = original[..tag_end].to_vec();
+        bytes.resize(bytes.len() + padding, 0);
+        bytes.extend(audio());
+        bytes.extend(b"LYRICSBEGIN000011LYRICS200");
+        bytes.extend(crate::media::ape::tests::tag(true, 200));
+        let actual = t.read(&bytes).unwrap();
+        assert_eq!(actual.metadata.title, baseline.metadata.title);
+        assert_eq!(
+            actual.fingerprint.audio.sha256,
+            baseline.fingerprint.audio.sha256
+        );
+        assert_eq!(actual.audio_offset, (tag_end + padding) as u64);
+        actual.transferred_identity().unwrap();
+        assert!(
+            read_front_cover(&t.0.join("test.mp3"), &actual)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(t.0.join("test.mp3")).unwrap(), bytes);
+        let mut invalid = bytes;
+        invalid[tag_end + padding / 2] = 42;
+        assert!(t.read(&invalid).is_err());
+    }
+}
+
+#[test]
+fn extended_headers_and_noncanonical_text_encodings_are_read_without_rewriting() {
+    let t = Temp::new();
+    for version in [3, 4] {
+        let ext = if version == 3 {
+            vec![0, 0, 0, 6, 0, 0, 0, 0, 0, 0]
+        } else {
+            vec![0, 0, 0, 6, 1, 0]
+        };
+        let mut body = ext;
+        body.extend(frame("TIT2", b"\x03Track", version));
+        let mut bytes = b"ID3".to_vec();
+        bytes.extend([version, 0, 0x60]);
+        bytes.extend(safe(body.len()));
+        bytes.extend(body);
+        bytes.extend(audio());
+        assert_eq!(t.read(&bytes).unwrap().metadata.title, ["Track"]);
+    }
+    // Extra single NUL is not a truncated audio frame; invalid text units are
+    // represented explicitly instead of turning a playable file into an error.
+    for (data, expected) in [
+        (b"\x01\xff\xfeT\0\0".as_slice(), "T"),
+        (b"\x01\xff\xfe\0\xd8".as_slice(), "\u{fffd}"),
+        (b"\x03A\xffB".as_slice(), "A\u{fffd}B"),
+    ] {
+        let bytes = tagged(vec![frame("TIT2", data, 3)], 3);
+        assert_eq!(t.read(&bytes).unwrap().metadata.title, [expected]);
+    }
+}
+
+#[test]
+fn missing_mp3_title_projects_filename_without_creating_a_tag_or_changing_bytes() {
+    let temp = Temp::new();
+    let bytes = tagged(
+        vec![frame("TPE1", b"\0Artist", 3), frame("TALB", b"\0Album", 3)],
+        3,
+    );
+    let source = temp.read(&bytes).unwrap();
+    assert!(source.metadata.title.is_empty());
+    assert_eq!(source.fallback_title.as_deref(), Some("test"));
+    assert_eq!(projection::project(&source).unwrap().title, "test");
+    let renamed = temp.0.join("Summertime Sadness.mp3");
+    fs::rename(temp.0.join("test.mp3"), &renamed).unwrap();
+    let renamed_source = read(&renamed).unwrap();
+    assert_eq!(
+        projection::project(&renamed_source).unwrap().title,
+        "Summertime Sadness"
+    );
+    assert_eq!(renamed_source.fingerprint, source.fingerprint);
+    assert_eq!(fs::read(&renamed).unwrap(), bytes);
+    assert!(
+        read_front_cover(&renamed, &renamed_source)
+            .unwrap()
+            .is_none()
+    );
+    let tagged = temp
+        .read(&tagged(
+            vec![
+                frame("TIT2", b"\0Real Title", 3),
+                frame("TPE1", b"\0Artist", 3),
+                frame("TALB", b"\0Album", 3),
+            ],
+            3,
+        ))
+        .unwrap();
+    assert!(tagged.fallback_title.is_none());
+    assert_eq!(projection::project(&tagged).unwrap().title, "Real Title");
+}
+
+#[test]
+fn an_untagged_mp3_projects_filename_and_unknown_artist_without_retagging() {
+    let temp = Temp::new();
+    let bytes = audio();
+    let source = temp.read(&bytes).unwrap();
+    let projected = projection::project(&source).unwrap();
+    assert_eq!(projected.title, "test");
+    assert_eq!(projected.artist, "Unknown Artist");
+    assert_eq!(projected.album, "Unknown Album");
+    assert!(source.metadata.title.is_empty());
+    assert!(source.metadata.artist.is_empty());
+    assert_eq!(fs::read(temp.0.join("test.mp3")).unwrap(), bytes);
+}
+
+#[test]
+fn empty_utf16_text_fields_need_no_bom_and_do_not_hide_populated_metadata() {
+    let t = Temp::new();
+    for version in [3, 4] {
+        let bytes = tagged(
+            vec![
+                frame("TENC", &[1], version),
+                frame("TCOP", &[1], version),
+                frame("TOPE", &[1], version),
+                frame("TCOM", &[1], version),
+                frame("TIT2", b"\0Track", version),
+                frame("TPE1", b"\0Artist", version),
+                frame("TALB", b"\0Album", version),
+            ],
+            version,
+        );
+        let source = t.read(&bytes).unwrap();
+        assert_eq!(source.metadata.title, ["Track"]);
+        assert_eq!(source.metadata.artist, ["Artist"]);
+        assert!(
+            crate::media::metadata::tag_values(&source.metadata.composer)
+                .next()
+                .is_none()
+        );
+        assert_eq!(projection::project(&source).unwrap().album, "Album");
+        // Nonempty UTF-16 still needs explicit byte order; never guess it.
+        assert!(
+            t.read(&tagged(vec![frame("TIT2", b"\x01xx", version)], version))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn every_declared_encoding_accepts_empty_fields_across_legacy_tag_versions() {
+    let t = Temp::new();
+    for encoding in 0..=3 {
+        for version in [3, 4] {
+            for id in [
+                "TIT2", "TPE1", "TALB", "TPE2", "TCOM", "TCOP", "TYER", "TRCK", "TPOS", "TCMP",
+                "TSOT", "TSOP",
+            ] {
+                let source = t
+                    .read(&tagged(vec![frame(id, &[encoding], version)], version))
+                    .unwrap();
+                assert_eq!(
+                    source.fingerprint.audio.frame_count,
+                    audio().len() as u32 / 417
+                );
+            }
+        }
+        for id in ["TT2", "TP1", "TAL", "TCM", "TCR", "TYE", "TRK", "TPA"] {
+            let frame = [id.as_bytes(), &[0, 0, 1], &[encoding]].concat();
+            let bytes = [
+                b"ID3\x02\0\0".as_slice(),
+                &safe(frame.len()),
+                &frame,
+                &audio(),
+            ]
+            .concat();
+            assert!(t.read(&bytes).is_ok(), "{id} {encoding}");
+        }
+    }
+    let error = t
+        .read(&tagged(vec![frame("TIT2", b"\x01bad", 3)], 3))
+        .err()
+        .unwrap();
+    let error = format!("{error:#}");
+    assert!(error.contains("TIT2 frame at byte 10"));
+    assert!(error.contains("UTF16 BOM"));
+    assert!(t.read(&tagged(vec![frame("TIT2", &[255], 3)], 3)).is_err());
+}
+
+#[test]
+fn mixed_id3_padding_is_accepted_in_tags_and_artwork_rereads_but_not_unknown_bytes() {
+    let t = Temp::new();
+    let original = tagged(vec![frame("TIT2", b"\0Track", 3)], 3);
+    let base = t.read(&original).unwrap();
+    for inside in [false, true] {
+        let fields = frame("TIT2", b"\0Track", 3);
+        let padding = b" \0  \0 ";
+        let length = fields.len() + if inside { padding.len() } else { 0 };
+        let bytes = [
+            b"ID3\x03\0\0".as_slice(),
+            &safe(length),
+            &fields,
+            padding,
+            &audio(),
+        ]
+        .concat();
+        let source = t.read(&bytes).unwrap();
+        assert_eq!(
+            source.fingerprint.audio.sha256,
+            base.fingerprint.audio.sha256
+        );
+        assert_eq!(source.metadata.title, ["Track"]);
+        assert!(
+            read_front_cover(&t.0.join("test.mp3"), &source)
+                .unwrap()
+                .is_none()
+        );
+        let mut bad = bytes.clone();
+        bad[10 + fields.len() + 1] = b'X';
+        assert!(t.read(&bad).is_err());
+    }
 }

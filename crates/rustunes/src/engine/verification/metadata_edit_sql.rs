@@ -1038,6 +1038,125 @@ pub(crate) fn verify(
     verify_in(before, after, operation, base_anchor, Window::SameRun)
 }
 
+/// Favorite-only receiver path, qualified by the native round-trip probe.
+/// Normalize only the requested liked_state cells, then use the complete
+/// metadata-session model for revisions, bookkeeping and all other SQL rows.
+pub(crate) fn verify_favorites(
+    before: &Tables,
+    after: &Tables,
+    changes: &[(u64, u32, u32)],
+    base_anchor: u32,
+    later: bool,
+) -> Result<MetadataEditReceipt> {
+    ensure!(
+        !changes.is_empty() && changes.len() <= 500,
+        "invalid favorite batch size"
+    );
+    ensure!(
+        before.keys().eq(after.keys())
+            && before.iter().all(
+                |(n, t)| t.columns == after[n].columns && t.definitions == after[n].definitions
+            ),
+        "favorite table layout changed"
+    );
+    ensure!(
+        decimal(property(before, ANCHOR)?, false)? == i64::from(base_anchor),
+        "favorite before anchor differs"
+    );
+    let mut normalized = before.clone();
+    let mut edits = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &(wire, old, new) in changes {
+        ensure!(
+            wire != 0
+                && seen.insert(wire)
+                && matches!(old, 0 | 1 | 2)
+                && matches!(new, 0 | 1 | 2)
+                && old != new,
+            "invalid favorite transition"
+        );
+        let store = table(before, "item_store")?;
+        let row = store.one("sync_id", wire as i64)?;
+        let pid = typed::int(store, row, "item_pid")?;
+        for name in ["item_stats", "item_state"] {
+            let mut row = Rec::load(&normalized, name, "item_pid", pid)?;
+            ensure!(
+                row.int("liked_state")? == i64::from(old),
+                "favorite prestate differs"
+            );
+            row.set("liked_state", int(i64::from(new)))?;
+            row.store(&mut normalized)?;
+        }
+        edits.push(Edit {
+            sync_id: wire,
+            item_pid: pid,
+            keys: vec!["liked_state".into()],
+            ..Default::default()
+        });
+    }
+    absorb_favorite_representatives(&mut normalized, before, after, &edits)?;
+    model_session(
+        &normalized,
+        after,
+        base_anchor,
+        base_anchor.checked_add(1).context("anchor exhausted")?,
+        &edits,
+        if later {
+            Window::LaterRun
+        } else {
+            Window::SameRun
+        },
+    )
+}
+
+/// iOS may reselect an artist representative while applying favorites. It is
+/// bookkeeping only: the new representative must be an existing member of the
+/// same artist before and after, and the artist must contain an edited track.
+/// No names, membership, other group fields or untouched artists are absorbed.
+fn absorb_favorite_representatives(
+    expected: &mut Tables,
+    before: &Tables,
+    after: &Tables,
+    edits: &[Edit],
+) -> Result<()> {
+    for (name, key) in [
+        ("album_artist", "album_artist_pid"),
+        ("item_artist", "item_artist_pid"),
+    ] {
+        let items = table(before, "item")?;
+        let mut groups = BTreeSet::new();
+        for edit in edits {
+            groups.insert(typed::int(
+                items,
+                items.one("item_pid", edit.item_pid)?,
+                key,
+            )?);
+        }
+        for group in groups {
+            if group == 0 {
+                continue;
+            }
+            let observed = table(after, name)?;
+            let row = observed.one(key, group)?;
+            let chosen = typed::int(observed, row, "representative_item_pid")?;
+            let mut original = Rec::load(expected, name, key, group)?;
+            if original.int("representative_item_pid")? == chosen {
+                continue;
+            }
+            let after_items = table(after, "item")?;
+            ensure!(
+                chosen != 0
+                    && typed::int(items, items.one("item_pid", chosen)?, key)? == group
+                    && typed::int(after_items, after_items.one("item_pid", chosen)?, key)? == group,
+                "favorite representative is outside its original artist group"
+            );
+            original.set("representative_item_pid", int(chosen))?;
+            original.store(expected)?;
+        }
+    }
+    Ok(())
+}
+
 /// `verify` for a later run's capture, after the phone may have been used:
 /// the session is modelled exactly, and what the phone did since is
 /// absorbed as `Window::LaterRun` allows.

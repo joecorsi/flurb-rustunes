@@ -422,6 +422,9 @@ fn observation(event: &Observation<'_>) -> Result<()> {
     let line = crate::cli::progress::observation_line(event);
     use Level::{Info, Warning};
     match event {
+        Observation::PreparingTransferAssets { done, total } => {
+            sources_counted("prepare_transfer_assets", *done, *total, line)
+        }
         Observation::CapturingCatalogue => phase("capture_device", Some(line)),
         Observation::RevalidatingSources { done, total } => {
             sources_counted("revalidate_sources", *done, *total, line)

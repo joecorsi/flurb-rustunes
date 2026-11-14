@@ -286,14 +286,14 @@ fn mpeg_tag_spans_and_native_transfer_size_ceiling_are_explicit() {
     assert_eq!(json["trailing_tag_bytes"], 128);
     assert_eq!(json["encoded_identity_verified"], false);
     // Scheduling uses the same fixed cap as upload/readback, never a new lower cap.
-    assert!(schedule(&[(0, MAX_AUDIO)], 1).is_ok());
+    assert!(schedule(&[(0, 1024 * 1024 * 1024)], 1).is_ok());
     assert!(schedule(&[(0, MAX_AUDIO + 1)], 1).is_err());
-    let c = mpeg_current(MAX_AUDIO + 1);
+    let c = mpeg_current(64 * 1024 * 1024);
     let mut oversized = content;
     oversized.source.file_bytes = MAX_AUDIO + 1;
     assert_eq!(
         catalog_finding(&oversized, Some(&c.catalog.tracks()[0]), 1),
-        Some("audio_exceeds_64mib_read_bound")
+        Some("catalog_audio_size_differs")
     );
     let mut ctrl = control();
     ctrl.deadline = Instant::now();
@@ -390,8 +390,8 @@ async fn mixed_alac_mpeg_schedule_keeps_both_typed_paths_and_alac_track_bytes() 
     );
 }
 #[test]
-fn actual_frame_parser_accepts_the_exact_native_cap_and_refuses_one_more_byte() {
-    let size = usize::try_from(MAX_AUDIO).unwrap();
+fn actual_frame_parser_accepts_a_mix_above_the_old_native_cap() {
+    let size = 64 * 1024 * 1024 + 1;
     let span = size / 417 * 417;
     let offset = size - span;
     assert!(offset >= 10 && offset < 417);
@@ -413,8 +413,8 @@ fn actual_frame_parser_accepts_the_exact_native_cap_and_refuses_one_more_byte() 
     assert_eq!(facts["audio_bytes"], span);
     assert_eq!(facts["frame_count"], span / 417);
     bytes.push(0);
-    let error = mpeg::inspect(&bytes, &control()).err().unwrap();
-    assert!(error.to_string().contains("native transfer bound"));
+    // Keep rejecting an incomplete audio frame, independently of file size.
+    assert!(mpeg::inspect(&bytes, &control()).is_err());
 }
 
 #[tokio::test]

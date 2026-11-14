@@ -286,14 +286,14 @@ pub fn inspect(path: &Path, decode: bool) -> Report {
                     ),
                 }
                 if decode {
-                    match decode_audio(path, DECODE_DEADLINE).and_then(|()| {
+                    match decode_audio(path, DECODE_DEADLINE).and_then(|diagnostics| {
                         ensure!(
                             music_protocol::media::mpeg::read(path)? == source,
                             "source changed during decode"
                         );
-                        Ok(())
+                        Ok(diagnostics)
                     }) {
-                        Ok(()) => report.decode = Decode::Passed,
+                        Ok(diagnostics) => decoded(&mut report, diagnostics),
                         Err(error) => {
                             report.decode = Decode::Failed;
                             report.issue(Severity::Error, "decode_failed", format!("{error:#}"));
@@ -418,7 +418,7 @@ fn inspect_inner(path: &Path, decode: bool, report: &mut Report) -> Result<()> {
     }
     if decode {
         match decode_audio(path, DECODE_DEADLINE) {
-            Ok(()) => report.decode = Decode::Passed,
+            Ok(diagnostics) => decoded(report, diagnostics),
             Err(error) => {
                 report.decode = Decode::Failed;
                 report.issue(Severity::Error, "audio_decode_failed", format!("{error:#}"));
@@ -532,7 +532,7 @@ fn check_tags(source: &metadata::Metadata, report: &mut Report) {
 
 /// Run FFmpeg directly, never through a shell. Input has already passed the
 /// self-contained single-track check. Bound runtime and captured diagnostics.
-fn decode_audio(path: &Path, deadline: Duration) -> Result<()> {
+fn decode_audio(path: &Path, deadline: Duration) -> Result<String> {
     let absolute = fs::canonicalize(path)?;
     let mut child = Command::new("ffmpeg")
         .args([
@@ -576,17 +576,34 @@ fn decode_audio(path: &Path, deadline: Duration) -> Result<()> {
     let (log, truncated) = receiver
         .recv_timeout(Duration::from_secs(2))
         .context("closing FFmpeg diagnostics")??;
+    decode_result(status, &log, truncated)
+}
+
+fn decode_result(status: std::process::ExitStatus, log: &[u8], truncated: bool) -> Result<String> {
+    // -xerror makes decoder failures fatal. Demuxers may still report
+    // recoverable metadata diagnostics while audio decoding succeeds.
     ensure!(
-        status.success() && log.is_empty() && !truncated,
+        status.success() && !truncated,
         "FFmpeg decode did not complete cleanly (status {status}): {}{}",
-        String::from_utf8_lossy(&log),
+        String::from_utf8_lossy(log),
         if truncated {
             " [diagnostics truncated]"
         } else {
             ""
         }
     );
-    Ok(())
+    Ok(String::from_utf8_lossy(log).into_owned())
+}
+
+fn decoded(report: &mut Report, diagnostics: String) {
+    report.decode = Decode::Passed;
+    if !diagnostics.is_empty() {
+        report.issue(
+            Severity::Warning,
+            "decoder_diagnostics",
+            format!("Audio decoded successfully; FFmpeg reported: {diagnostics}"),
+        );
+    }
 }
 
 fn bounded_log(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> {
@@ -651,6 +668,26 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_diagnostics_are_warnings_but_failed_or_truncated_results_still_fail() {
+        use std::os::unix::process::ExitStatusExt;
+        let success = std::process::ExitStatus::from_raw(0);
+        let diagnostics =
+            decode_result(success, b"Cannot read BOM value, input too short", false).unwrap();
+        let mut report = inspect(&fixture("silence-alac.m4a"), false);
+        decoded(&mut report, diagnostics);
+        assert!(report.decode == Decode::Passed);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "decoder_diagnostics" && i.severity == Severity::Warning)
+        );
+        assert!(decode_result(std::process::ExitStatus::from_raw(256), b"", false).is_err());
+        assert!(decode_result(success, b"excess diagnostics", true).is_err());
+        assert_eq!(decode_result(success, b"", false).unwrap(), "");
+    }
 
     fn fixture(name: &str) -> std::path::PathBuf {
         crate::test_fixtures::workspace_root()

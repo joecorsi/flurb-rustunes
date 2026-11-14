@@ -582,8 +582,12 @@ pub(super) fn codec(dto: CodecDto, file_bytes: u64) -> Result<OtherCodec> {
                 [32000, 44100, 48000].contains(&sample_rate)
                     && [1, 2].contains(&channels)
                     && (2..=2_000_000).contains(&frame_count)
-                    && audio_offset <= 16 * 1024 * 1024 + 20
-                    && [0, 128].contains(&trailing_tag_bytes)
+                    && audio_offset <= 512 * 1024 * 1024
+                    && music_protocol::media::fingerprint::EncodedMpeg1Layer3::valid_trailing_bytes(
+                        sample_rate,
+                        frame_count,
+                        u64::from(trailing_tag_bytes)
+                    )
                     && audio_bytes >= u64::from(frame_count) * 96
                     && audio_bytes <= u64::from(frame_count) * 1441
                     && audio_offset
@@ -870,6 +874,94 @@ mod tests {
             assert!(parse_allowing(&bytes, &binding, &identity, &targets, &none, true).is_err());
         }
     }
+    #[test]
+    fn receipt_accepts_a_verified_partial_final_mpeg_frame_without_loosening_size_checks() {
+        let (mut value, binding, identity, mut targets) = fixture();
+        let path = "iTunes_Control/Music/F41/TAIL.mp3";
+        let bytes = 11_035_418;
+        value["other_track_count"] = json!(1);
+        value["track_count"] = json!(2);
+        value["total_bytes"] = json!(targets[0].bytes + bytes);
+        value["other_records"] = json!([{
+            "sync_id":"0000000000000002", "afc_path":path, "file_bytes":bytes,
+            "full_file_sha256":hex(&[7;32]),
+            "attributes":{"st_ifmt":"S_IFREG","st_mtime":"1","st_size":bytes.to_string()},
+            "codec":{"kind":"mpeg1-layer3","sample_rate":44100,"channels":2,
+                "frame_count":10450,"audio_offset":115428,"audio_bytes":10919183,
+                "trailing_tag_bytes":807}
+        }]);
+        targets.push(Target {
+            sync_id: 2,
+            path: path.into(),
+            bytes,
+        });
+        let parsed = parse(
+            &serde_json::to_vec(&value).unwrap(),
+            &binding,
+            &identity,
+            &targets,
+        )
+        .unwrap();
+        assert_eq!(parsed.other_audio.len(), 1);
+        // Prefix padding and trailing tags are retained in transfer accounting,
+        // including a gap larger than the old metadata allocation limit.
+        for (offset, trailing) in [(56_395u64, 0u64), (17 * 1024 * 1024, 69_774)] {
+            let bytes = offset + 10_919_183 + trailing;
+            let mut padded = value.clone();
+            let mut padded_targets = targets.clone();
+            padded_targets[1].bytes = bytes;
+            padded["total_bytes"] = json!(padded_targets[0].bytes + bytes);
+            padded["other_records"][0]["file_bytes"] = json!(bytes);
+            padded["other_records"][0]["attributes"]["st_size"] = json!(bytes.to_string());
+            padded["other_records"][0]["codec"]["audio_offset"] = json!(offset);
+            padded["other_records"][0]["codec"]["trailing_tag_bytes"] = json!(trailing);
+            assert!(
+                parse(
+                    &serde_json::to_vec(&padded).unwrap(),
+                    &binding,
+                    &identity,
+                    &padded_targets
+                )
+                .is_ok()
+            );
+            padded["other_records"][0]["codec"]["audio_offset"] = json!(offset + 1);
+            assert!(
+                parse(
+                    &serde_json::to_vec(&padded).unwrap(),
+                    &binding,
+                    &identity,
+                    &padded_targets
+                )
+                .is_err()
+            );
+        }
+        for trailing in [808, 0, 128, 2000] {
+            let mut changed = value.clone();
+            changed["other_records"][0]["codec"]["trailing_tag_bytes"] = json!(trailing);
+            assert!(
+                parse(
+                    &serde_json::to_vec(&changed).unwrap(),
+                    &binding,
+                    &identity,
+                    &targets
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            !music_protocol::media::fingerprint::EncodedMpeg1Layer3::valid_trailing_bytes(
+                44100,
+                10450,
+                16 * 1024 * 1024 + 4096
+            )
+        );
+        assert!(
+            !music_protocol::media::fingerprint::EncodedMpeg1Layer3::valid_trailing_bytes(
+                44100, 1, 807
+            )
+        );
+    }
+
     #[test]
     fn mixed_receipt_preserves_other_codec_without_an_alac_identity() {
         let (mut value, binding, identity, mut targets) = fixture();

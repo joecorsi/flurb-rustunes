@@ -32,6 +32,7 @@ pub use crate::engine::recovery::resume::{
 };
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
+pub use execution::apply::PhoneChangedBeforeTransfer;
 pub use execution::change::{Outcome as ChangeApplyOutcome, Request as ChangeApplyRequest};
 pub use execution::pull::{
     NOT_IN_LIBRARY, PhoneTrack as PulledTrack, Report as PullResult, Request as PullRequest,
@@ -49,6 +50,7 @@ pub use planning::metadata_intent::{
     MetadataWireCandidate,
 };
 pub use planning::{PlanRequest, PlanResult};
+pub use state::audio_index::cache::{Config as FingerprintCache, Mode as FingerprintCacheMode};
 pub use verification::VerificationRequest;
 
 /// Explicit execution dependencies. `None` retains each operation's existing
@@ -61,7 +63,12 @@ pub struct Config {
 }
 
 type Observer = Arc<dyn for<'a> Fn(Event<'a>) -> Result<()> + Send + Sync>;
-tokio::task_local! { static CURRENT_OBSERVER: Observer; }
+tokio::task_local! { static CURRENT_OBSERVER: Observer; static CURRENT_CANCELLATION: Arc<AtomicBool>; }
+pub(crate) fn cancellation() -> Arc<AtomicBool> {
+    CURRENT_CANCELLATION
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)))
+}
 
 /// Observe a nested engine mechanism without granting it command-line coupling.
 pub(crate) fn observe(event: Event<'_>) -> Result<()> {
@@ -90,6 +97,7 @@ pub(crate) fn warn(event: Event<'_>, fallback: impl FnOnce() -> String) {
 pub struct Engine {
     config: Config,
     observer: Observer,
+    fingerprint_cache: Option<FingerprintCache>,
 }
 
 impl Engine {
@@ -100,7 +108,27 @@ impl Engine {
         Self {
             config,
             observer: Arc::new(observer),
+            fingerprint_cache: None,
         }
+    }
+    /// Use the same stat-bound fingerprint/artwork cache as the CLI. Misses,
+    /// changed files and unavailable caches retain the full readback path.
+    pub fn with_fingerprint_cache(mut self, cache: FingerprintCache) -> Self {
+        self.fingerprint_cache = Some(cache);
+        self
+    }
+    /// Reuse stat-keyed local file hashes across syncs. Changed files and
+    /// unreadable caches always fall back to a streamed read.
+    pub fn with_source_cache(self, directory: std::path::PathBuf) -> Self {
+        planning::source_reads::persist(directory.clone(), true);
+        planning::file_hashes::configure(directory);
+        self
+    }
+    pub fn local_source_sha256(&self, path: &std::path::Path) -> Result<String> {
+        self.check()?;
+        Ok(music_protocol::protocol::transfer::hex(
+            &planning::file_hashes::read(path, &self.config.cancelled)?,
+        ))
     }
     pub fn quiet(config: Config) -> Self {
         Self::new(config, |_| Ok(()))
@@ -211,18 +239,26 @@ impl Engine {
     }
     /// Scope an engine operation or CLI command to this explicit device
     /// configuration. Nested engines remain isolated from one another.
-    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
-        let observer = Arc::clone(&self.observer);
-        CURRENT_OBSERVER
-            .scope(
-                Arc::clone(&self.observer),
-                crate::engine::execution::device::scope_with_observer(
-                    self.config.device.clone(),
-                    move |event| observer(Event::Device(event)),
-                    future,
+    pub fn scope<'a, F: Future + 'a>(&'a self, future: F) -> impl Future<Output = F::Output> + 'a {
+        // Frontends/CLI compose large futures. Heap-bound the input before
+        // adding task-local wrappers so nesting does not multiply stack use.
+        let future = Box::pin(future);
+        async move {
+            let observer = Arc::clone(&self.observer);
+            state::audio_index::cache::scope_counted(
+                self.fingerprint_cache.clone(),
+                CURRENT_OBSERVER.scope(
+                    Arc::clone(&self.observer),
+                    crate::engine::execution::device::scope_with_observer(
+                        self.config.device.clone(),
+                        move |event| observer(Event::Device(event)),
+                        CURRENT_CANCELLATION.scope(Arc::clone(&self.config.cancelled), future),
+                    ),
                 ),
             )
             .await
+            .0
+        }
     }
     /// Install this observer for synchronous work, including an explicitly
     /// cloned engine moved into a blocking task. The guard restores outer scope.

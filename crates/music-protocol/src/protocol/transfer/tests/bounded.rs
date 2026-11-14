@@ -38,7 +38,7 @@ async fn a_connection_takes_at_most_a_batch_sessions_allowance() {
         (1, true),
         (MAX_SESSION_OPS, true),
         (0, false),
-        (MAX_SESSION_OPS + 1, false),
+        (MAX_AUDIO_SESSION_OPS + 1, false),
     ] {
         let (client, _peer) = tokio::io::duplex(64);
         let transfer = Transfer::from_test_duplex(client, &trace.0, &control, operations);

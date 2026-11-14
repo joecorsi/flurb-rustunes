@@ -33,6 +33,17 @@ mod refresh;
 
 mod sequence;
 
+/// A fresh plan may be attempted: this check runs before any transfer,
+/// journal reservation, or native write in this apply invocation.
+#[derive(Debug)]
+pub struct PhoneChangedBeforeTransfer;
+impl std::fmt::Display for PhoneChangedBeforeTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the phone's library or preferences changed after planning (playing music changes it, and the phone also renumbers its library on its own a few minutes after a sync); no transfer started, take a fresh snapshot and plan again")
+    }
+}
+impl std::error::Error for PhoneChangedBeforeTransfer {}
+
 pub struct Options<'a> {
     pub plan: &'a Path,
     pub snapshot: &'a Path,
@@ -100,7 +111,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<ApplyRe
             && current.catalog.persisted_media_anchor() == validated.plan.media_anchor
             && current.raw_preferences == validated.snapshot.raw_preferences
             && current.plist_preferences == validated.snapshot.plist_preferences,
-        "the phone's library or preferences changed after planning (playing music changes it, and the phone also renumbers its library on its own a few minutes after a sync); no transfer started, take a fresh snapshot and plan again"
+        PhoneChangedBeforeTransfer
     );
     // Qualify all runtime template fields before creating a journal or reservation.
     templates::build_from_copied_cdb(

@@ -2,7 +2,7 @@
 //! ID3 or FLAC cover's checksum counts the image payload alone, where an MP4
 //! cover's (AAC) counts the whole `data` atom header too.
 use anyhow::Result;
-use music_protocol::media::mpeg::{Source, read_front_cover};
+use music_protocol::media::mpeg::{Source, read_front_cover_for_upload};
 use std::path::Path;
 
 /// The cover an insert batch sends with a source's audio: the picture
@@ -14,7 +14,7 @@ pub(crate) fn batch_cover(
     path: &Path,
     source: &Source,
 ) -> Result<Option<music_protocol::media::artwork::Cover>> {
-    let Some(cover) = read_front_cover(path, source)? else {
+    let Some(cover) = read_front_cover_for_upload(path, source)? else {
         return Ok(None);
     };
     music_protocol::media::artwork::sent_cover(

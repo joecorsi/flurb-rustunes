@@ -2,34 +2,34 @@
 //! The complete bounded frame scan is hash-bound to EncodedMpeg1Layer3. Fractions
 //! retain sample counts/rate exactly; no rounded duration enters identity.
 use anyhow::{Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     io::{Read, Seek, SeekFrom},
 };
 
-const MAX_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_BYTES: u64 = crate::protocol::transfer::MAX_AUDIO;
 const MAX_FRAMES: u32 = 2_000_000;
 const SAMPLES: u64 = 1152;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SampleDuration {
     pub samples: u64,
     pub sample_rate: u32,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BitrateCount {
     pub kbps: u16,
     pub frames: u32,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BitrateMode {
     Constant,
     Variable,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrameSummary {
     pub frame_count: u32,
     pub coded_duration: SampleDuration,
@@ -39,9 +39,10 @@ pub struct FrameSummary {
     pub channel_mode_counts: [u32; 4],
     pub crc_protected_frames: u32,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimingEvidence {
-    pub schema: &'static str,
+    #[serde(deserialize_with = "crate::media::mpeg::cached_word")]
+    pub schema: crate::media::mpeg::InspectionLabel,
     pub frame_bytes_sha256: String,
     pub physical: FrameSummary,
     /// Only Xing/Info explicitly establishes a separate leading metadata frame.
@@ -52,28 +53,32 @@ pub struct TimingEvidence {
     pub header: Option<SeekHeader>,
     pub native_timing_qualified: bool,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SeekHeader {
     Xing(XingInfo),
     Info(XingInfo),
     Vbri(Vbri),
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XingInfo {
     pub frame_offset: u16,
     pub flags: u32,
     /// This declaration excludes the leading Xing/Info frame; checked against
-    /// the actual scan, when present. Missing is unknown, never zero.
+    /// the actual scan when nonzero. Zero is retained as an empty encoder
+    /// placeholder; physical frame counts still come from the complete scan.
     pub declared_audio_frames: Option<u32>,
+    /// Advisory encoder declaration; MP3Gain/retagging can leave it stale.
+    /// Physical frame extents and hashes always come from the complete scan.
     pub declared_stream_bytes: Option<u32>,
     pub toc: Option<Vec<u8>>,
     pub quality: Option<u32>,
     pub encoder: Option<EncoderTag>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncoderTag {
-    pub family: &'static str,
+    #[serde(deserialize_with = "crate::media::mpeg::cached_word")]
+    pub family: crate::media::mpeg::InspectionLabel,
     pub identifier_hex: String,
     pub revision: u8,
     pub method: u8,
@@ -84,13 +89,13 @@ pub struct EncoderTag {
     pub raw_tag_sha256: String,
     pub crc_verified: bool,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VbriCountBasis {
     PhysicalFrames,
     ExcludingFirstFrame,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vbri {
     pub frame_offset: u16,
     pub version: u16,
@@ -206,12 +211,12 @@ pub(super) fn inspect<R: Read + Seek>(reader: &mut R, span: FrameSpan) -> Result
     let mut hash = Sha256::new();
     // MPEG-1 Layer III max: 320 kbps / 32 kHz + one padding byte.
     let mut frame = [0u8; 1441];
+    reader.seek(SeekFrom::Start(offset))?;
     while offset < end {
         ensure!(
             all.frames < span.frames && end - offset >= 4,
             "MPEG timing frame count/extent differs"
         );
-        reader.seek(SeekFrom::Start(offset))?;
         reader.read_exact(&mut frame[..4])?;
         let h = header(&frame[..4])?;
         ensure!(
@@ -323,13 +328,11 @@ fn parse_xing(b: &[u8], at: usize, span: &FrameSpan) -> Result<XingInfo> {
     let frames = if flags & 1 != 0 { Some(r.u32()?) } else { None };
     let bytes = if flags & 2 != 0 { Some(r.u32()?) } else { None };
     ensure!(
-        frames.is_none_or(|n| n == span.frames - 1),
+        frames.is_none_or(|n| n == 0 || n == span.frames - 1),
         "Xing/Info frame count contradicts complete scan"
     );
-    ensure!(
-        bytes.is_none_or(|n| u64::from(n) == span.bytes),
-        "Xing/Info stream size contradicts complete scan"
-    );
+    // This is an encoder estimate, not a read bound. Zero is an unwritten
+    // placeholder; stale positive estimates also do not override the scan.
     let toc = if flags & 4 != 0 {
         let toc = r.take(100)?.to_vec();
         ensure!(
@@ -350,29 +353,39 @@ fn parse_xing(b: &[u8], at: usize, span: &FrameSpan) -> Result<XingInfo> {
     let encoder = if let Some(family) = family {
         let tag = r.take(36)?;
         let revision = tag[9] >> 4;
-        ensure!(revision == 0, "unsupported MPEG encoder tag revision");
-        let delay = (u16::from(tag[21]) << 4) | u16::from(tag[22] >> 4);
-        let padding = (u16::from(tag[22] & 15) << 8) | u16::from(tag[23]);
-        let samples = u64::from(span.frames - 1) * SAMPLES;
-        let trim = u64::from(delay) + u64::from(padding);
         ensure!(
-            trim < samples,
-            "MPEG encoder trim exceeds audio sample count"
+            revision == 0 || family != "LAME",
+            "unsupported MPEG encoder tag revision"
         );
-        Some(EncoderTag {
-            family,
-            identifier_hex: super::hex(&tag[..9]),
-            revision,
-            method: tag[9] & 15,
-            delay_samples: delay,
-            padding_samples: padding,
-            declared_trimmed_duration: SampleDuration {
-                samples: samples - trim,
-                sample_rate: span.sample_rate,
-            },
-            raw_tag_sha256: super::hex(&Sha256::digest(tag)),
-            crc_verified: false,
-        })
+        if revision != 0 && family != "LAME" {
+            // Lavf identifiers can be longer than LAME's nine-byte name; the
+            // next byte is part of that name, not a LAME revision/trim header.
+            // Keep the Xing facts and let the independent gapless rule decide.
+            None
+        } else {
+            let delay = (u16::from(tag[21]) << 4) | u16::from(tag[22] >> 4);
+            let padding = (u16::from(tag[22] & 15) << 8) | u16::from(tag[23]);
+            let samples = u64::from(span.frames - 1) * SAMPLES;
+            let trim = u64::from(delay) + u64::from(padding);
+            ensure!(
+                trim < samples,
+                "MPEG encoder trim exceeds audio sample count"
+            );
+            Some(EncoderTag {
+                family,
+                identifier_hex: super::hex(&tag[..9]),
+                revision,
+                method: tag[9] & 15,
+                delay_samples: delay,
+                padding_samples: padding,
+                declared_trimmed_duration: SampleDuration {
+                    samples: samples - trim,
+                    sample_rate: span.sample_rate,
+                },
+                raw_tag_sha256: super::hex(&Sha256::digest(tag)),
+                crc_verified: false,
+            })
+        }
     } else {
         None
     };

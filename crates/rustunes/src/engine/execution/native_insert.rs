@@ -34,8 +34,8 @@ use music_protocol::catalogue::sqlite::Catalog;
 use music_protocol::protocol::ancillary::EligibleSnapshot;
 use music_protocol::protocol::session::{self, Session};
 use music_protocol::protocol::transfer::{
-    Attributes, MAX_AUDIO, MAX_BOUNDED_OPS, MAX_CATALOG, MAX_SESSION_OPS, METADATA, SIGNATURE,
-    Transfer, hex, regular_size, same_file,
+    Attributes, MAX_AUDIO, MAX_CATALOG, MAX_SESSION_OPS, METADATA, SIGNATURE, Transfer, hex,
+    regular_size, same_file,
 };
 
 const SMALL: u64 = 1024 * 1024;
@@ -855,7 +855,7 @@ fn operation_budget(state: &FreshState, source_bytes: u64) -> Result<usize> {
         .context("AFC operation budget overflow")?;
     let operations = usize::try_from(operations)?;
     ensure!(
-        operations <= MAX_BOUNDED_OPS,
+        operations <= music_protocol::protocol::transfer::MAX_AUDIO_SESSION_OPS,
         "derived AFC operation allowance exceeds bound"
     );
     Ok(operations)
@@ -1017,7 +1017,7 @@ pub(crate) fn upload_budget(source_bytes: u64) -> Result<usize> {
     );
     let operations = usize::try_from(source_bytes.div_ceil(CHUNK) * 2 + 64)?;
     ensure!(
-        operations <= MAX_BOUNDED_OPS,
+        operations <= music_protocol::protocol::transfer::MAX_AUDIO_SESSION_OPS,
         "audio upload allowance exceeds bound"
     );
     Ok(operations)

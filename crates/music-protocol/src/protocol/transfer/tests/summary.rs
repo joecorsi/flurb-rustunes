@@ -45,6 +45,9 @@ async fn assert_no_request(peer: &mut Idevice) {
 async fn summary_many_chunks_save_one_complete_hash_and_attributes_receipt() {
     let trace = Temporary::new();
     let (mut transfer, mut peer) = summary_pair(&trace.0);
+    // This case checks bounded streaming receipts, not scheduler latency while
+    // other catalogue fixtures compile or hash large payloads in parallel.
+    transfer.deadline = Instant::now() + Duration::from_secs(30);
     let source = vec![0xa5; 24 * CHUNK + 3];
     let size = source.len() as u64;
     let expected: [u8; 32] = Sha256::digest(&source).into();

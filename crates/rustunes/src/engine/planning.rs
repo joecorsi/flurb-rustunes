@@ -17,7 +17,14 @@ pub struct PlanRequest<'a> {
     /// `--flac-to-alac`: plan FLAC additions as ALACs converted from them.
     pub flac_to_alac: bool,
 }
+pub(crate) struct Retained {
+    pub sources: source_collection::SourceCollection,
+    pub snapshot: snapshot::Snapshot,
+    pub identity: journal::Identity,
+    pub journal: Option<journal::Journal>,
+}
 pub struct PlanResult {
+    pub(crate) retained: Option<Retained>,
     pub add_only: bool,
     pub plan: additive::Plan,
     pub serialized: Vec<u8>,
@@ -31,6 +38,11 @@ pub struct PlanResult {
     pub source_exclusions: usize,
 }
 impl PlanResult {
+    /// Plan-time omissions, available before execution for frontends that
+    /// require every selected source rather than allowing a partial playlist.
+    pub fn skipped_sources(&self) -> Vec<super::Skipped> {
+        super::Skipped::planned(&self.plan)
+    }
     pub fn ready(&self) -> bool {
         !self.plan.has_conflicts()
     }
@@ -100,6 +112,12 @@ pub(super) fn run(request: PlanRequest<'_>, engine: &Engine) -> Result<PlanResul
         conflicts: counts.conflicts,
         skipped: counts.skipped,
         source_exclusions: sources.exclusions.len(),
+        retained: Some(Retained {
+            sources,
+            snapshot,
+            identity,
+            journal,
+        }),
     })
 }
 
@@ -114,3 +132,5 @@ pub(crate) mod saved_plan;
 pub(crate) mod source_collection;
 pub(crate) mod source_reads;
 pub(crate) mod source_validation;
+
+pub(crate) mod file_hashes;

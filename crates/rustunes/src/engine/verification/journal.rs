@@ -675,7 +675,7 @@ fn catalog_finding(
         return Some("catalog_audio_size_differs");
     }
     if content.source.file_bytes == 0 || content.source.file_bytes > MAX_AUDIO {
-        return Some("audio_exceeds_64mib_read_bound");
+        return Some("audio_exceeds_native_size_range");
     }
     None
 }
@@ -789,11 +789,9 @@ fn schedule(files: &[(usize, u64)], state_chunks: u64) -> Result<(Vec<Batch>, u6
             "scheduled audio exceeds per-file bound"
         );
         let cost = size.div_ceil(REQUEST) + 6;
-        ensure!(
-            fixed + cost <= MAX_BOUNDED_OPS as u64,
-            "state plus one audio exceeds connection budget"
-        );
-        if operations + cost > MAX_BOUNDED_OPS as u64 {
+        // A large file gets its own finite allowance; the normal grouping
+        // threshold must not become a per-track size ceiling.
+        if !indices.is_empty() && operations + cost > MAX_BOUNDED_OPS as u64 {
             batches.push(Batch {
                 indices: std::mem::take(&mut indices),
                 operations: usize::try_from(operations)?,
@@ -835,7 +833,26 @@ trait ReadBatch {
         Ok(all)
     }
     async fn audio_hash(&mut self, path: &str, size: u64) -> Result<[u8; 32]>;
+    #[cfg(test)]
     async fn mpeg_bytes(&mut self, path: &str, size: u64) -> Result<Vec<u8>>;
+    async fn mpeg_readback(
+        &mut self,
+        path: &str,
+        size: u64,
+        control: &ReadControl,
+    ) -> Result<([u8; 32], mpeg::MpegFrameReport)> {
+        #[cfg(test)]
+        {
+            let bytes = self.mpeg_bytes(path, size).await?;
+            ensure!(bytes.len() as u64 == size, "MPEG readback size differs");
+            mpeg::inspect(&bytes, control)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (path, size, control);
+            anyhow::bail!("streamed MPEG reader required")
+        }
+    }
 }
 impl ReadBatch for Transfer {
     async fn state_guard(&mut self, state: &FreshState) -> Result<()> {
@@ -850,17 +867,36 @@ impl ReadBatch for Transfer {
     async fn audio_hash(&mut self, path: &str, size: u64) -> Result<[u8; 32]> {
         self.read_hash(path, size, MAX_AUDIO).await
     }
-    async fn mpeg_bytes(&mut self, path: &str, size: u64) -> Result<Vec<u8>> {
-        // Same cap as the native sender and existing managed readback. Only one
-        // MPEG file is retained in memory; the readonly summary logs no payload.
-        ensure!(
-            (1..=MAX_AUDIO).contains(&size),
-            "MPEG read exceeds native transfer bound"
+    #[cfg(test)]
+    async fn mpeg_bytes(&mut self, _: &str, _: u64) -> Result<Vec<u8>> {
+        anyhow::bail!("Transfer uses streamed MPEG readback")
+    }
+    async fn mpeg_readback(
+        &mut self,
+        path: &str,
+        size: u64,
+        control: &ReadControl,
+    ) -> Result<([u8; 32], mpeg::MpegFrameReport)> {
+        ensure!(size > 0 && size <= MAX_AUDIO, "invalid MPEG readback size");
+        let name = format!(
+            "rustunes-mpeg-readback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
         );
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(usize::try_from(size)?)?;
-        self.read_exact(path, size, MAX_AUDIO, &mut bytes).await?;
-        Ok(bytes)
+        let temp = std::env::temp_dir().join(name);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        // Unlink immediately: success, errors, cancellation, and process exit
+        // all release the scratch copy without leaving an audio backup behind.
+        std::fs::remove_file(&temp)?;
+        self.read_exact(path, size, MAX_AUDIO, &mut file).await?;
+        mpeg::inspect_reader(&mut file, size, control)
     }
 }
 async fn read_batch(
@@ -924,14 +960,9 @@ async fn read_batch(
                 .audio_hash(&content.path, content.source.file_bytes)
                 .await?
         } else {
-            let bytes = reader
-                .mpeg_bytes(&content.path, content.source.file_bytes)
+            let (hash, frames) = reader
+                .mpeg_readback(&content.path, content.source.file_bytes, control)
                 .await?;
-            ensure!(
-                bytes.len() as u64 == content.source.file_bytes,
-                "MPEG readback size differs"
-            );
-            let (hash, frames) = mpeg::inspect(&bytes, control)?;
             report.mpeg_frame_readback = Some(frames);
             hash
         };

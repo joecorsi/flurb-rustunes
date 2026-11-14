@@ -15,7 +15,7 @@ use super::held_source::same_observed_file as same_metadata;
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
-const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = crate::protocol::transfer::MAX_AUDIO;
 const MAX_BOXES: usize = 128;
 pub(crate) const MAX_SAMPLES: u32 = 1_048_576;
 const MAX_CHUNKS: u32 = MAX_SAMPLES;

@@ -7,7 +7,7 @@
 //! Fraunhofer's CRC-protected `0xB4` marker is not read; a file with one goes
 //! by the search.
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
 use symphonia_core::{
     audio::SampleBuffer,
@@ -23,7 +23,8 @@ const ANALYSED: u32 = 0x0200_0003;
 
 /// What Apple's rule reads from an ID3v2 tag besides the catalogue fields
 /// (`0x140436bc8`, `0x14043686c`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EncoderHints {
     /// The last TENC or TSSE text; before one, the first comment's
     /// description, or its text when it has none. At most 255 bytes.
@@ -85,7 +86,7 @@ fn truncated(text: &str) -> &str {
 /// how they were found (`heuristic`) and where the eighth frame from the end
 /// starts (`resynch`, an MP3's only). An insert sends them as its gapless
 /// fields.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gapless {
     pub delay: u64,
     pub drain: u64,
@@ -104,7 +105,7 @@ impl Gapless {
 }
 
 /// What Apple's sync sends for one MPEG Layer III file.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppleTiming {
     /// The frames Apple counts: a Xing or VBRI header's count when it
     /// differs from the byte estimate, else the estimate when it is within
@@ -127,7 +128,8 @@ pub struct AppleTiming {
     pub heuristic: u32,
     /// Where delay and drain came from: `itunsmpb`, `lame_tag`, `smpb_frame`
     /// or `analysis` (the encoder rule and the tail search).
-    pub source: &'static str,
+    #[serde(deserialize_with = "crate::media::mpeg::cached_word")]
+    pub source: crate::media::mpeg::InspectionLabel,
 }
 
 #[derive(Clone, Copy)]
@@ -327,18 +329,24 @@ pub fn analyse(
     let mut first: Option<(Header, Vec<u8>)> = None;
     let mut second = None;
     let mut at = start;
+    input.seek(SeekFrom::Start(at))?;
+    let mut body = [0; 8192];
     while at < end {
         ensure!(offsets.len() < MAX_FRAMES, "MPEG frame count bound");
-        input.seek(SeekFrom::Start(at))?;
         let mut word = [0; 4];
         input.read_exact(&mut word)?;
         let h = header(word)
             .filter(|h| h.bytes <= end - at)
             .with_context(|| format!("MPEG frame {} is damaged or truncated", offsets.len()))?;
+        let body_bytes = usize::try_from(h.bytes - 4)?;
+        ensure!(
+            body_bytes <= body.len(),
+            "MPEG frame exceeds physical format bound"
+        );
+        input.read_exact(&mut body[..body_bytes])?;
         if offsets.len() < 2 {
-            let mut frame = vec![0; h.bytes as usize];
-            input.seek(SeekFrom::Start(at))?;
-            input.read_exact(&mut frame)?;
+            let mut frame = word.to_vec();
+            frame.extend_from_slice(&body[..body_bytes]);
             if first.is_none() {
                 first = Some((h, frame));
             } else {
