@@ -31,9 +31,9 @@ use crate::{
 };
 use music_protocol::catalogue::artwork_update;
 use music_protocol::catalogue::sqlite::Catalog;
-use music_protocol::media::artwork::{self, Cover};
+use music_protocol::media::artwork::Cover;
 use music_protocol::media::artwork_inventory;
-use music_protocol::media::fingerprint::{self, SourceFingerprint};
+use music_protocol::media::fingerprint::TransferredSource;
 use music_protocol::protocol::session::{self, Session};
 use music_protocol::protocol::templates;
 use music_protocol::protocol::transfer::{
@@ -126,7 +126,7 @@ pub struct ArtworkUpdate<'a, 'catalog> {
     pub attempt: AttemptId,
     pub source: &'a Path,
     /// Current desired source, not the journal's transferred audio container.
-    pub desired_source: &'a SourceFingerprint,
+    pub desired_source: &'a TransferredSource,
     pub state: &'a FreshArtworkState<'catalog>,
     pub host_name: &'a str,
     /// Must not exist; all partial evidence is retained on failure.
@@ -180,21 +180,18 @@ where
     );
     let prepared = &attempt.prepared;
     let state = update.state;
-    let source = BoundSource::open(update.source, update.desired_source)?;
-    let current = fingerprint::read(update.source)?;
+    let source = BoundSource::open_observed(
+        update.source,
+        update.desired_source.file_bytes,
+        update.desired_source.full_file_sha256,
+    )?;
+    let (current, cover) = super::cover::read_source(update.source)?;
     ensure!(
         current == *update.desired_source,
         "desired source fingerprint changed"
     );
-    let art = artwork::read(update.source)?;
     source.check()?;
-    ensure!(
-        art.source_size == current.file_bytes && art.source_sha256 == current.full_file_sha256,
-        "artwork source differs from validated source"
-    );
-    let cover = art
-        .cover
-        .context("desired source contains no supported JPEG or PNG cover")?;
+    let cover = cover.context("desired source contains no supported front cover")?;
     validate_preparation(journal, prepared, state, &current, &cover)?;
     let asset_id = (prepared.content.track_pid as i64).to_string();
     let policy = state.common.ancillary().artwork(&asset_id)?;
@@ -338,11 +335,19 @@ where
     result
 }
 
+// Tag/artwork edits can move the audio payload and change trailing tags.
+// Validated codec-tagged digests identify the frames, independently of layout.
+pub(crate) fn same_encoded_audio(desired: &TransferredSource, transferred: &TransferredSource) -> Result<bool> {
+    desired.validate()?;
+    transferred.validate()?;
+    Ok(desired.format() == transferred.format() && desired.audio.sha256 == transferred.audio.sha256)
+}
+
 fn validate_preparation(
     journal: &Journal,
     prepared: &PreparedAttempt,
     state: &FreshArtworkState<'_>,
-    desired: &SourceFingerprint,
+    desired: &TransferredSource,
     cover: &Cover,
 ) -> Result<()> {
     journal.ensure_identity(&Identity::new(
@@ -363,7 +368,7 @@ fn validate_preparation(
     );
     let content = &prepared.content;
     ensure!(
-        desired.audio == content.source.audio,
+        same_encoded_audio(desired, &content.source)?,
         "desired source encoded audio differs from transferred audio"
     );
     ensure!(
@@ -434,12 +439,13 @@ fn validate_preparation(
         .context("prepared artwork timestamp missing")?
         .into();
     ensure!(
-        artwork_update::prepare(
+        artwork_update::prepare_for_format(
             state.catalog,
             content.track_pid,
             art.cache_id,
             cover,
-            timestamp
+            timestamp,
+            content.source.format(),
         )? == prepared.operation,
         "prepared operation differs from exact artwork-only rebuild"
     );
@@ -547,7 +553,7 @@ fn binary(dictionary: Dictionary) -> Result<Vec<u8>> {
 fn input_receipt(
     prepared: &PreparedAttempt,
     state: &FreshArtworkState<'_>,
-    desired: &SourceFingerprint,
+    desired: &TransferredSource,
 ) -> Result<Vec<u8>> {
     let art = prepared
         .content

@@ -462,12 +462,13 @@ fn verify_artwork_catalog(
         .context("prepared artwork missing")?;
     let cover = retained.cover.as_ref().context("retained cover missing")?;
     ensure!(
-        artwork_update::prepare(
+        artwork_update::prepare_for_format(
             &retained.before,
             attempt.prepared.content.track_pid,
             art.cache_id,
             cover,
-            operation_time(&attempt.prepared.operation)?
+            operation_time(&attempt.prepared.operation)?,
+            attempt.prepared.content.source.format(),
         )? == attempt.prepared.operation,
         "artwork operation does not rebuild from retained cover"
     );
@@ -908,7 +909,9 @@ pub fn load_run(
         );
         Some(Cover {
             checksum: u32::try_from(bytes.len())?
-                .checked_add(17)
+                .checked_add(music_protocol::media::artwork::checksum_header(
+                    attempt.prepared.content.source.format(),
+                ))
                 .context("cover checksum overflow")?,
             sha256: art.sha256,
             bytes,

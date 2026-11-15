@@ -30,7 +30,7 @@ use std::{
     },
 };
 
-mod mpeg_cache;
+pub(crate) mod mpeg_cache;
 pub(crate) use mpeg_cache::read as mpeg;
 
 const WORKERS: usize = 8;

@@ -328,7 +328,7 @@ fn existing_duplicate_audio_retains_every_identity_in_machine_output() {
         .unwrap();
         assert!(matches!(
             plan.sources[0].decision,
-            Decision::Conflict {
+            Decision::Skip {
                 code: "multiple_existing_audio_matches",
                 ..
             }
@@ -338,7 +338,7 @@ fn existing_duplicate_audio_retains_every_identity_in_machine_output() {
         assert!(!plan.execution_authorized_by_plan);
         let output = serde_json::to_value(&plan).unwrap();
         let row = &output["sources"][0];
-        assert_eq!(row["decision"], "conflict");
+        assert_eq!(row["decision"], "skip");
         assert_eq!(row["code"], "multiple_existing_audio_matches");
         assert!(row.get("track_id").is_none());
         let matches = row["matches"].as_array().unwrap();
@@ -737,6 +737,7 @@ fn metadata_difference_and_plausibility_rules_do_not_turn_titles_into_identity()
     let s = ProjectedFields::from_source(&sources().tracks[0].metadata).unwrap();
     track.metadata.title = s.title.to_ascii_uppercase();
     track.metadata.artist = s.artist.clone();
+    track.metadata.album = s.album.clone();
     track.metadata.total_time_ms = s.total_time_ms as u32 + 1000;
     assert!(plausible(&s, &track));
     assert!(!differences(&s, &track).is_empty());
@@ -746,7 +747,7 @@ fn metadata_difference_and_plausibility_rules_do_not_turn_titles_into_identity()
     track.metadata.artist = "unrelated".into();
     assert!(!plausible(&s, &track));
     track.metadata.album = s.album.clone();
-    assert!(plausible(&s, &track));
+    assert!(!plausible(&s, &track)); // a compilation album does not establish artist identity
     track.metadata.title = s.title.clone();
     track.metadata.artist = s.artist.clone();
     track.metadata.album_artist = s.grouping_artist.clone();
@@ -2962,4 +2963,40 @@ fn a_managed_match_without_a_proven_cover_has_its_cover_sent_again() {
         row("inserted_by_us", proven, Decision::Keep).cover_resent(false),
         None
     );
+}
+
+
+#[test]
+fn a_similar_album_cannot_make_another_artists_track_a_duplicate() {
+    let sources = sources();
+    let mut fields = ProjectedFields::from_source(&sources.tracks[0].metadata).unwrap();
+    fields.title = "Shared title".into(); fields.artist = "Artist A".into();
+    fields.album = "Compilation".into(); fields.total_time_ms = 10000;
+    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
+    let mut track = catalog.tracks()[0].clone();
+    track.metadata.title = fields.title.clone(); track.metadata.album = fields.album.clone();
+    track.metadata.total_time_ms = 10000; track.metadata.artist = "Artist B".into();
+    assert!(!plausible(&fields, &track));
+    track.metadata.artist = fields.artist.clone();
+    assert!(plausible(&fields, &track));
+    fields.artist.clear(); track.metadata.artist.clear();
+    assert!(!plausible(&fields, &track));
+}
+
+
+#[test]
+fn matching_title_artist_and_duration_on_a_different_release_is_not_a_duplicate() {
+    let sources = sources();
+    let mut fields = ProjectedFields::from_source(&sources.tracks[0].metadata).unwrap();
+    fields.title = "E.R[WTT]".into(); fields.artist = "Knxwledge".into();
+    fields.album = "Hexual Sealings Prt.8".into(); fields.total_time_ms = 62990;
+    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
+    let mut track = catalog.tracks()[0].clone();
+    track.metadata.title = "E.R[Wtt]".into(); track.metadata.artist = fields.artist.clone();
+    track.metadata.album = "Gladwemet EP".into(); track.metadata.total_time_ms = 63033;
+    assert!(!plausible(&fields, &track));
+    track.metadata.album = fields.album.clone();
+    assert!(plausible(&fields, &track));
+    fields.album.clear(); track.metadata.album.clear();
+    assert!(!plausible(&fields, &track));
 }

@@ -211,6 +211,7 @@ pub struct Transfer {
     operation_limit: usize,
     cancelled: Option<Arc<AtomicBool>>,
     readonly_summary: bool,
+    upload_summary: bool,
     current_summary: bool,
     recent_frames: VecDeque<Value>,
     readbacks: usize,
@@ -254,6 +255,7 @@ impl Transfer {
             operation_limit: operations,
             cancelled: Some(control.cancelled.clone()),
             readonly_summary: false,
+            upload_summary: false,
             current_summary: false,
             recent_frames: VecDeque::new(),
             readbacks: 0,
@@ -356,6 +358,22 @@ impl Transfer {
         .await
     }
 
+    /// Bounded uploads retain per-file hashes and durable session receipts,
+    /// with a bounded recent-packet diagnostic instead of fsyncing two trace
+    /// files for every AFC request. This does not grant write authority.
+    pub async fn connect_bounded_upload(
+        provider: &dyn IdeviceProvider,
+        trace: &Path,
+        deadline: Instant,
+        operations: usize,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let mut transfer =
+            Self::connect_bounded(provider, trace, deadline, operations, cancelled).await?;
+        transfer.upload_summary = true;
+        Ok(transfer)
+    }
+
     /// Read-only, bounded verification without per-chunk files or payload logs.
     /// Each completed read retains one hash/attributes receipt. At most eight
     /// recent frame headers are retained in memory and one bounded diagnostic is
@@ -432,6 +450,7 @@ impl Transfer {
             operation_limit: operations,
             cancelled,
             readonly_summary,
+            upload_summary: false,
             current_summary: false,
             recent_frames: VecDeque::new(),
             readbacks: 0,
@@ -445,7 +464,10 @@ impl Transfer {
     }
 
     fn summary_result<T>(&mut self, result: Result<T>) -> Result<T> {
-        if !self.readonly_summary || result.is_ok() || self.failure_recorded {
+        if !(self.readonly_summary || self.upload_summary)
+            || result.is_ok()
+            || self.failure_recorded
+        {
             return result;
         }
         self.usable = false;
@@ -720,9 +742,10 @@ impl Transfer {
             self.sequence < self.operation_limit && Instant::now() < self.deadline,
             "AFC operation/deadline budget exhausted"
         );
+        let summary = self.readonly_summary || self.upload_summary;
         let sequence = self.sequence;
         self.sequence += 1;
-        if self.readonly_summary {
+        if summary {
             self.summary_frame(sequence, operation, &header);
         } else {
             let mut intent = Dictionary::new();
@@ -738,7 +761,7 @@ impl Transfer {
                 &Value::Dictionary(intent),
             )?;
         }
-        let reply_reservation = if !self.readonly_summary {
+        let reply_reservation = if !summary {
             self.output
                 .as_ref()
                 .map(|output| output.reserve_file(40, u64::MAX))
@@ -764,7 +787,7 @@ impl Transfer {
             match exchange {
                 Ok(reply) => Ok(reply),
                 Err(error) => {
-                    if self.output.is_some() && !self.readonly_summary {
+                    if self.output.is_some() && !summary {
                         self.evidence_reserved_bytes(
                             &format!("afc-{sequence:04}-error.txt"),
                             bounded_error(&error).as_bytes(),
@@ -783,7 +806,7 @@ impl Transfer {
         };
         match result {
             Ok(Ok(reply)) => {
-                if self.readonly_summary {
+                if summary {
                     self.summary_reply(&reply);
                 } else if raw_reply {
                     self.evidence_reply(sequence, &reply, reply_reservation)?;
@@ -842,7 +865,7 @@ impl Transfer {
                 Ok(Reply::Packet(reply))
             }
             Ok(Err(error)) => {
-                if !self.readonly_summary {
+                if !summary {
                     let text = if self.output.is_some() {
                         bounded_debug(&error)
                     } else {
@@ -874,7 +897,7 @@ impl Transfer {
                 Err(anyhow::anyhow!(error).context("AFC operation failed; journal retained"))
             }
             Err(_) => {
-                if !self.readonly_summary {
+                if !summary {
                     self.evidence_reserved_bytes(
                         &format!("afc-{sequence:04}-error.txt"),
                         b"Operation timeout; connection discarded, no cleanup I/O\n",
@@ -1646,6 +1669,7 @@ mod tests {
                 operation_limit: MAX_OPS,
                 cancelled: None,
                 readonly_summary: false,
+                upload_summary: false,
                 current_summary: false,
                 recent_frames: VecDeque::new(),
                 readbacks: 0,
@@ -2125,68 +2149,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audio_over_64_mib_streams_without_relaxing_metadata_limits() {
+    async fn compact_upload_does_not_unlock_a_connection() {
         let trace = Temporary::new();
-        let (mut transfer, mut peer) = pair(&trace.0, Duration::from_secs(20));
-        transfer.unlock_writes();
-        let size = 64 * 1024 * 1024 + 1;
+        let (mut transfer, mut peer) = pair(&trace.0, Duration::from_secs(5));
+        transfer.upload_summary = true;
         assert!(
             transfer
-                .write_new("Airlock/Media/123.m4a", &mut std::io::empty(), size)
-                .await
-                .is_err()
-        );
-        assert!(
-            transfer
-                .write_audio_new(
-                    "Airlock/Media/123.m4a",
-                    &mut std::io::empty(),
-                    MAX_AUDIO + 1
-                )
+                .write_new("Airlock/locked", &mut Cursor::new(b"x"), 1)
                 .await
                 .is_err()
         );
         assert_eq!(transfer.sequence, 0);
-        let server = tokio::spawn(async move {
-            let req = request(&mut peer, AfcOpcode::GetDevInfo).await;
-            reply(
-                &mut peer,
-                &req,
-                AfcOpcode::Data,
-                Vec::new(),
-                b"FSFreeBytes\x001099511627776\x00".to_vec(),
-            )
-            .await;
-            open_fresh(&mut peer).await;
-            let mut remaining = size;
-            let mut digest = Sha256::new();
-            while remaining > 0 {
-                let req = request(&mut peer, AfcOpcode::Write).await;
-                assert_eq!(req.payload.len() as u64, remaining.min(CHUNK as u64));
-                assert!(req.payload.iter().all(|byte| *byte == 7));
-                remaining -= req.payload.len() as u64;
-                digest.update(&req.payload);
-                status(&mut peer, &req, 0).await;
-            }
-            let set = request(&mut peer, AfcOpcode::FileSetSize).await;
-            assert_eq!(
-                set.header_payload,
-                [42_u64.to_le_bytes(), size.to_le_bytes()].concat()
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), AfcPacket::read(&mut peer))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_over_64_mib_streams_without_relaxing_metadata_limits() {
+        for compact in [false, true] {
+            let trace = Temporary::new();
+            let (mut transfer, mut peer) = pair(&trace.0, Duration::from_secs(20));
+            transfer.upload_summary = compact;
+            transfer.unlock_writes();
+            let size = 64 * 1024 * 1024 + 1;
+            assert!(
+                transfer
+                    .write_new("Airlock/Media/123.m4a", &mut std::io::empty(), size)
+                    .await
+                    .is_err()
             );
-            status(&mut peer, &set, 0).await;
-            close(&mut peer).await;
-            attributes(&mut peer, size).await;
-            <[u8; 32]>::from(digest.finalize())
-        });
-        let hash = transfer
-            .write_audio_new(
-                "Airlock/Media/123.m4a",
-                &mut std::io::repeat(7).take(size),
-                size,
-            )
-            .await
-            .unwrap();
-        assert_eq!(hash, server.await.unwrap());
+            assert!(
+                transfer
+                    .write_audio_new(
+                        "Airlock/Media/123.m4a",
+                        &mut std::io::empty(),
+                        MAX_AUDIO + 1
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(transfer.sequence, 0);
+            let server = tokio::spawn(async move {
+                let req = request(&mut peer, AfcOpcode::GetDevInfo).await;
+                reply(
+                    &mut peer,
+                    &req,
+                    AfcOpcode::Data,
+                    Vec::new(),
+                    b"FSFreeBytes\x001099511627776\x00".to_vec(),
+                )
+                .await;
+                open_fresh(&mut peer).await;
+                let mut remaining = size;
+                let mut digest = Sha256::new();
+                while remaining > 0 {
+                    let req = request(&mut peer, AfcOpcode::Write).await;
+                    assert_eq!(req.payload.len() as u64, remaining.min(CHUNK as u64));
+                    assert!(req.payload.iter().all(|byte| *byte == 7));
+                    remaining -= req.payload.len() as u64;
+                    digest.update(&req.payload);
+                    status(&mut peer, &req, 0).await;
+                }
+                let set = request(&mut peer, AfcOpcode::FileSetSize).await;
+                assert_eq!(
+                    set.header_payload,
+                    [42_u64.to_le_bytes(), size.to_le_bytes()].concat()
+                );
+                status(&mut peer, &set, 0).await;
+                close(&mut peer).await;
+                attributes(&mut peer, size).await;
+                <[u8; 32]>::from(digest.finalize())
+            });
+            let hash = transfer
+                .write_audio_new(
+                    "Airlock/Media/123.m4a",
+                    &mut std::io::repeat(7).take(size),
+                    size,
+                )
+                .await
+                .unwrap();
+            assert_eq!(hash, server.await.unwrap());
+            if compact {
+                assert!(std::fs::read_dir(&trace.0).unwrap().next().is_none());
+                assert_eq!(transfer.recent_frames.len(), SUMMARY_FRAMES);
+            }
+        }
     }
 
     #[tokio::test]

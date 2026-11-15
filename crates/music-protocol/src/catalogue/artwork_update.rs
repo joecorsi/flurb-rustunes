@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     catalogue::sqlite::{Catalog, Track},
-    media::artwork::Cover,
+    media::{
+        artwork::{self, Cover},
+        format::Format,
+    },
 };
 
 const MAX_COVER_BYTES: usize = 32 * 1024 * 1024;
@@ -28,8 +31,28 @@ pub fn prepare(
     cover: &Cover,
     timestamp: SystemTime,
 ) -> Result<Vec<u8>> {
+    prepare_for_format(
+        catalog,
+        track_sync_id,
+        cache_id,
+        cover,
+        timestamp,
+        Format::Alac,
+    )
+}
+
+/// Prepare an artwork update using the verified permanent audio container's
+/// checksum convention. MP3/FLAC/PCM covers do not contain an MP4 data atom.
+pub fn prepare_for_format(
+    catalog: &Catalog,
+    track_sync_id: u64,
+    cache_id: u32,
+    cover: &Cover,
+    timestamp: SystemTime,
+    format: Format,
+) -> Result<Vec<u8>> {
     let track = target(catalog.tracks(), track_sync_id)?;
-    operation(
+    operation_for_format(
         CatalogIdentity {
             database: catalog.database_pid(),
             primary_container: catalog.primary_container_pid(),
@@ -39,6 +62,7 @@ pub fn prepare(
         cache_id,
         cover,
         timestamp,
+        format,
     )
 }
 
@@ -58,12 +82,24 @@ struct CatalogIdentity {
     anchor: u32,
 }
 
+#[cfg(test)]
 fn operation(
     catalog: CatalogIdentity,
     track: &Track,
     cache_id: u32,
     cover: &Cover,
     timestamp: SystemTime,
+) -> Result<Vec<u8>> {
+    operation_for_format(catalog, track, cache_id, cover, timestamp, Format::Alac)
+}
+
+fn operation_for_format(
+    catalog: CatalogIdentity,
+    track: &Track,
+    cache_id: u32,
+    cover: &Cover,
+    timestamp: SystemTime,
+    format: Format,
 ) -> Result<Vec<u8>> {
     ensure!(
         catalog.database != 0 && catalog.primary_container != 0,
@@ -93,7 +129,7 @@ fn operation(
             .as_deref()
             .context("artwork target has no local media path")?,
     )?;
-    validate_cover(cover)?;
+    validate_cover(cover, format)?;
 
     let mut db_info = Dictionary::new();
     db_info.insert(
@@ -128,7 +164,7 @@ fn operation(
     Ok(bytes)
 }
 
-fn validate_cover(cover: &Cover) -> Result<()> {
+fn validate_cover(cover: &Cover, format: Format) -> Result<()> {
     ensure!(
         (4..=MAX_COVER_BYTES).contains(&cover.bytes.len()),
         "artwork JPEG length outside supported range"
@@ -143,11 +179,11 @@ fn validate_cover(cover: &Cover) -> Result<()> {
         "artwork bytes do not match their digest"
     );
     let checksum = u32::try_from(cover.bytes.len())?
-        .checked_add(17)
+        .checked_add(artwork::checksum_header(format))
         .context("artwork checksum overflow")?;
     ensure!(
         cover.checksum == checksum,
-        "artwork checksum does not match the single JPEG data atom"
+        "artwork checksum does not match the target audio container"
     );
     Ok(())
 }
@@ -326,6 +362,42 @@ mod tests {
                 _ => c.checksum += 1,
             }
             assert!(operation(identity(12), &track(1), 100, &c, UNIX_EPOCH).is_err());
+        }
+    }
+    #[test]
+    fn artwork_only_updates_use_the_target_containers_checksum() {
+        for format in [
+            Format::Mpeg1Layer3,
+            Format::Mpeg2Layer3,
+            Format::Mpeg25Layer3,
+            Format::Flac,
+            Format::Wav,
+            Format::Aiff,
+            Format::Alac,
+            Format::AacLc,
+            Format::HeAac,
+            Format::HeAacV2,
+            Format::Usac,
+        ] {
+            let mut c = cover();
+            c.checksum = c.bytes.len() as u32 + artwork::checksum_header(format);
+            let bytes =
+                operation_for_format(identity(12), &track(1), 100, &c, UNIX_EPOCH, format).unwrap();
+            let value = Value::from_reader(std::io::Cursor::new(bytes)).unwrap();
+            let operations = value.as_dictionary().unwrap()["operations"]
+                .as_array()
+                .unwrap();
+            let item = operations[1].as_dictionary().unwrap()["item"]
+                .as_dictionary()
+                .unwrap();
+            assert_eq!(
+                item["artwork_checksum"].as_unsigned_integer(),
+                Some(c.checksum as u64)
+            );
+            c.checksum = c.bytes.len() as u32 + if format.mp4() { 1 } else { 17 };
+            assert!(
+                operation_for_format(identity(12), &track(1), 100, &c, UNIX_EPOCH, format).is_err()
+            );
         }
     }
 }

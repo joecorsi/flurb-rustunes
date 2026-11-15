@@ -105,6 +105,30 @@ impl Before {
     }
 }
 
+/// Carry a verified after-state into a new batch without another device capture.
+/// Preserve independent evidence directories for recovery. The native Ready
+/// guard still compares these exact catalogue/preferences bytes before sending.
+pub(crate) fn retain_before(
+    mut before: Before,
+    directory: &Path,
+    control: &Control,
+) -> Result<Before> {
+    control.check()?;
+    create_trace(directory)?;
+    copy_snapshot(
+        &before.directory.join("snapshot"),
+        &directory.join("snapshot"),
+    )?;
+    copy_snapshot(
+        &before.directory.join("current"),
+        &directory.join("current"),
+    )?;
+    before.snapshot = snapshot::open_with_control(&directory.join("snapshot"), control)?;
+    before.directory = directory.to_owned();
+    control.check()?;
+    Ok(before)
+}
+
 /// Capture a fresh complete snapshot and Current under `directory` (new).
 pub(crate) async fn capture_before(
     directory: &Path,
@@ -1524,4 +1548,76 @@ pub(crate) fn sha(bytes: &[u8]) -> [u8; 32] {
 }
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod retained_evidence_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "retained-batch-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn retained_batch_evidence_is_independent_and_never_overwrites() {
+        let temp = Temp::new();
+        let original = temp.path().join("verified");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(original.join("catalog")).unwrap();
+        fs::write(original.join("catalog/database"), b"verified database").unwrap();
+        fs::write(original.join("receipt.json"), b"verified receipt").unwrap();
+        let next = temp.path().join("next");
+        copy_snapshot(&original, &next).unwrap();
+        assert_eq!(
+            fs::read(next.join("catalog/database")).unwrap(),
+            b"verified database"
+        );
+        assert_eq!(
+            fs::read(next.join("receipt.json")).unwrap(),
+            b"verified receipt"
+        );
+        assert_eq!(
+            fs::metadata(&next).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_ne!(
+            fs::metadata(original.join("receipt.json")).unwrap().ino(),
+            fs::metadata(next.join("receipt.json")).unwrap().ino()
+        );
+        fs::write(original.join("receipt.json"), b"changed").unwrap();
+        assert!(copy_snapshot(&original, &next).is_err());
+        assert_eq!(
+            fs::read(next.join("receipt.json")).unwrap(),
+            b"verified receipt"
+        );
+    }
+
+    #[test]
+    fn retained_batch_evidence_refuses_symlinks() {
+        let temp = Temp::new();
+        let original = temp.path().join("verified");
+        fs::create_dir(&original).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"not evidence").unwrap();
+        symlink(&outside, original.join("receipt.json")).unwrap();
+        assert!(copy_snapshot(&original, &temp.path().join("next")).is_err());
+    }
 }

@@ -143,6 +143,11 @@ pub fn read(path: &Path) -> Result<SourceArtwork> {
 /// atom header and the picture count.
 pub const MP4_CHECKSUM_HEADER: u32 = 17;
 
+/// Native checksums include the MP4 data-atom header only for MP4 containers.
+pub const fn checksum_header(format: crate::media::format::Format) -> u32 {
+    if format.mp4() { MP4_CHECKSUM_HEADER } else { 1 }
+}
+
 /// The cover sync sends for an embedded image: a JPEG as it is, a PNG, GIF,
 /// BMP or TIFF as a JPEG ([`png::to_jpeg`], [`bitmap::to_jpeg`]), because the
 /// phone keeps only a JPEG. The checksum is Apple's for a file holding that

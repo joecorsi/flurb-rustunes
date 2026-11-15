@@ -169,6 +169,143 @@ fn folded(name: &str) -> String {
     }
 }
 
+/// Native case/diacritic grouping equivalence. Planners must reject ambiguous
+/// matches; verification also requires an unchanged observed internal lookup.
+/// This never establishes audio identity.
+pub fn native_artist_label(a: &str, b: &str) -> bool {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    let key = |text: &str| {
+        text.to_lowercase()
+            .nfd()
+            .filter(|c| !is_combining_mark(*c))
+            .collect::<String>()
+    };
+    key(a) == key(b)
+}
+
+#[derive(Serialize)]
+pub struct ArtistIdentityAdoption {
+    pub internal_id: i64,
+    pub name: String,
+    pub before: String,
+    pub after: String,
+}
+
+fn adopted_groups(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    removed: &BTreeSet<u64>,
+) -> Result<(
+    Catalog,
+    Vec<ArtistIdentityAdoption>,
+    Vec<ArtistIdentityAdoption>,
+)> {
+    let mut normalized = before.clone();
+    let mut adoptions = Vec::new();
+    for (id, old) in before.artists() {
+        let Some(new) = after.artists().get(id) else {
+            continue;
+        };
+        if old.sync_id == new.sync_id {
+            continue;
+        }
+        ensure!(
+            new.internal_id == old.internal_id
+                && new.name == old.name
+                && new.sort_name == old.sort_name,
+            "artist identity changed along with its native lookup or label"
+        );
+        ensure!(
+            !before.represented_sync_ids().contains(&new.sync_id),
+            "adopted artist identity was already occupied"
+        );
+        let mut joined = false;
+        for target in expected
+            .iter()
+            .filter(|e| !removed.contains(&e.track_id) && e.artist_id == new.sync_id)
+        {
+            let tags = target.metadata.projected()?;
+            ensure!(
+                native_artist_label(&old.name, tags.effective_artist()),
+                "artist identity adoption has an unrelated source label"
+            );
+            if let Some(track) = after.tracks().iter().find(|t| t.sync_id == target.track_id) {
+                ensure!(
+                    track.artist_sync_id == new.sync_id,
+                    "target did not join the adopted native artist"
+                );
+                joined = true;
+            }
+        }
+        ensure!(
+            joined,
+            "artist identity adoption was not requested by an inserted target"
+        );
+        normalized.remap_artist_identity(old.sync_id, new.sync_id);
+        adoptions.push(ArtistIdentityAdoption {
+            internal_id: *id,
+            name: old.name.clone(),
+            before: format!("{:016x}", old.sync_id),
+            after: format!("{:016x}", new.sync_id),
+        });
+    }
+    let mut album_adoptions = Vec::new();
+    for (id, old) in before.albums() {
+        let Some(new) = after.albums().get(id) else {
+            continue;
+        };
+        if old.sync_id == new.sync_id {
+            continue;
+        }
+        let owner = &normalized.albums()[id];
+        ensure!(
+            new.internal_id == old.internal_id
+                && new.name == old.name
+                && new.sort_name == old.sort_name
+                && new.artist_internal_id == old.artist_internal_id
+                && new.artist_sync_id == owner.artist_sync_id,
+            "album identity changed along with its native lookup, label, or artist"
+        );
+        ensure!(
+            !before.represented_sync_ids().contains(&new.sync_id),
+            "adopted album identity was already occupied"
+        );
+        let mut joined = false;
+        for target in expected
+            .iter()
+            .filter(|e| !removed.contains(&e.track_id) && e.album_id == new.sync_id)
+        {
+            let tags = target.metadata.projected()?;
+            ensure!(
+                native_artist_label(&old.name, tags.album)
+                    && target.artist_id == new.artist_sync_id,
+                "album identity adoption has an unrelated source or artist"
+            );
+            if let Some(track) = after.tracks().iter().find(|t| t.sync_id == target.track_id) {
+                ensure!(
+                    track.album_sync_id == new.sync_id
+                        && track.artist_sync_id == new.artist_sync_id,
+                    "target did not join the adopted native album"
+                );
+                joined = true;
+            }
+        }
+        ensure!(
+            joined,
+            "album identity adoption was not requested by an inserted target"
+        );
+        normalized.remap_album_identity(old.sync_id, new.sync_id);
+        album_adoptions.push(ArtistIdentityAdoption {
+            internal_id: *id,
+            name: old.name.clone(),
+            before: format!("{:016x}", old.sync_id),
+            after: format!("{:016x}", new.sync_id),
+        });
+    }
+    Ok((normalized, adoptions, album_adoptions))
+}
+
 /// A renamed lookup must still be equivalent to its old name and use a
 /// spelling actually supplied by this batch. Unicode normalization may change
 /// its representation, but an undeclared case change remains an unrelated edit.
@@ -301,7 +438,7 @@ fn verify_insert_with_policy(
     let inserted = after_tracks
         .get(&expected.track_id)
         .context("inserted identity absent from fresh catalogue")?;
-    let normalized_fields = check_inserted(inserted, expected, before)?;
+    let normalized_fields = check_inserted(inserted, expected, before, after)?;
     let targets = std::slice::from_ref(expected);
     let presented = presentations(before, targets)?;
     let composer_sort_delta = verify_composers(
@@ -679,6 +816,7 @@ fn check_inserted(
     track: &Track,
     expected: &ExpectedInsert<'_>,
     before: &Catalog,
+    after: &Catalog,
 ) -> Result<Vec<NormalizedField>> {
     let s = expected.metadata.projected()?;
     expected.metadata.ensure_compilation_profile()?;
@@ -725,9 +863,30 @@ fn check_inserted(
         .or(s.composer);
     ensure!(
         m.title == s.title
-            && same_group(&m.artist, s.artist)
-            && same_group(&m.album, s.album)
-            && same_group(&m.album_artist, s.effective_artist())
+            && (same_group(&m.artist, s.artist)
+                || after
+                    .track_item_artist(track.sync_id)
+                    .is_some_and(|joined| before
+                        .item_artists()
+                        .get(&joined.internal_id)
+                        .is_some_and(|old| old.name == joined.name
+                            && old.sort_name == joined.sort_name
+                            && joined.name == m.artist
+                            && native_artist_label(&old.name, s.artist))))
+            && (same_group(&m.album, s.album)
+                || before
+                    .albums()
+                    .values()
+                    .any(|a| a.sync_id == expected.album_id
+                        && a.name == m.album
+                        && native_artist_label(&a.name, s.album)))
+            && (same_group(&m.album_artist, s.effective_artist())
+                || before
+                    .artists()
+                    .values()
+                    .any(|a| a.sync_id == expected.artist_id
+                        && a.name == m.album_artist
+                        && native_artist_label(&a.name, s.effective_artist())))
             && same_optional(&m.genre, s.genre)
             && same_optional(&m.composer, expected_composer)
             && optional(&m.copyright, s.copyright),
@@ -1071,6 +1230,10 @@ fn verify_composers(
 /// Catalogue checks after one session inserted several ALAC tracks.
 #[derive(Serialize)]
 pub struct VerifiedInsertBatch {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artist_identity_adoptions: Vec<ArtistIdentityAdoption>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub album_identity_adoptions: Vec<ArtistIdentityAdoption>,
     pub schema: &'static str,
     pub track_ids: Vec<String>,
     pub media_anchor: u32,
@@ -1262,6 +1425,9 @@ fn verify_batch(
         after_tracks.len() == after.tracks().len(),
         "post-transfer track IDs alias"
     );
+    let (normalized_before, artist_identity_adoptions, album_identity_adoptions) =
+        adopted_groups(before, after, expected, removed)?;
+    let before = &normalized_before;
     let declared = Declared::of(expected.iter().filter(|e| present.contains(&e.track_id)))?;
     let (prior_recent_counter_resets, prior_tracks_listened_between_runs, mut case_renamed) =
         preserve_insert_tracks(before, after, &after_tracks, &present, listening, &declared)?;
@@ -1288,7 +1454,7 @@ fn verify_batch(
             );
             continue;
         }
-        let normalized = check_inserted(track, target, before)?;
+        let normalized = check_inserted(track, target, before, after)?;
         if !normalized.is_empty() {
             normalized_fields.push(InsertedFields {
                 track_id: format!("{:016x}", target.track_id),
@@ -1421,6 +1587,8 @@ fn verify_batch(
         set.difference(old).map(|id| format!("{id:016x}")).collect()
     };
     Ok(VerifiedInsertBatch {
+        artist_identity_adoptions,
+        album_identity_adoptions,
         schema: "music-protocol.insert-batch-catalog-verification",
         track_ids: expected
             .iter()
@@ -2160,6 +2328,158 @@ Line two' WHERE item_pid=2;
             compilation_expected(&b, false),
         ];
         assert!(verify_insert_batch(&before, &after, &expected).is_err());
+    }
+
+    #[test]
+    fn native_artist_identity_adoption_preserves_prior_tracks_and_rejects_unrelated_changes() {
+        let base = "UPDATE album_artist SET album_artist='Moiré' WHERE album_artist_pid=121;";
+        let before = compilation_state(1, base);
+        let change =
+            format!("{base} UPDATE album_artist SET sync_id=8100 WHERE album_artist_pid=121;");
+        let after = compilation_state_at(2, 14, &change);
+        let mut source = compilation_source("B", false);
+        source.album_artist = vec!["Moire".into()];
+        let expected = [ExpectedInsert {
+            artist_id: 8100,
+            ..compilation_expected(&source, false)
+        }];
+        let result = verify_insert_batch(&before, &after, &expected).unwrap();
+        assert_eq!(result.artist_identity_adoptions.len(), 1);
+        assert_eq!(result.artist_identity_adoptions[0].internal_id, 121);
+        for mutation in [
+            "UPDATE item_extra SET title='changed' WHERE item_pid=2;",
+            "UPDATE item_stats SET play_count_user=7 WHERE item_pid=2;",
+            "UPDATE album_artist SET album_artist='Different' WHERE album_artist_pid=121;",
+            "UPDATE album_artist SET sort_album_artist='Changed' WHERE album_artist_pid=121;",
+        ] {
+            let changed = compilation_state_at(2, 14, &format!("{change}{mutation}"));
+            assert!(
+                verify_insert_batch(&before, &changed, &expected).is_err(),
+                "{mutation}"
+            );
+        }
+        assert!(
+            verify_insert_batch(&before, &after, &[compilation_expected(&source, false)]).is_err()
+        );
+        source.album_artist = vec!["Unrelated".into()];
+        assert!(
+            verify_insert_batch(
+                &before,
+                &after,
+                &[ExpectedInsert {
+                    artist_id: 8100,
+                    ..compilation_expected(&source, false)
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_album_and_artist_ids_can_be_adopted_together_without_changing_tracks() {
+        let base = "UPDATE album_artist SET album_artist='Moiré' WHERE album_artist_pid=121;";
+        let before = compilation_state(1, base);
+        let change = format!(
+            "{base} UPDATE album_artist SET sync_id=8100 WHERE album_artist_pid=121;
+            UPDATE album SET sync_id=9100 WHERE album_pid=131;"
+        );
+        let after = compilation_state_at(2, 14, &change);
+        let mut source = compilation_source("B", false);
+        source.album_artist = vec!["Moire".into()];
+        let expected = [ExpectedInsert {
+            artist_id: 8100,
+            album_id: 9100,
+            ..compilation_expected(&source, false)
+        }];
+        let checked = verify_insert_batch(&before, &after, &expected).unwrap();
+        assert_eq!(checked.artist_identity_adoptions.len(), 1);
+        assert_eq!(checked.album_identity_adoptions.len(), 1);
+        for mutation in [
+            "UPDATE item_extra SET title='changed' WHERE item_pid=2;",
+            "UPDATE album SET album='Unrelated' WHERE album_pid=131;",
+            "UPDATE album SET sort_album='changed' WHERE album_pid=131;",
+            "UPDATE album SET album_artist_pid=21 WHERE album_pid=131; UPDATE item SET album_artist_pid=21 WHERE album_pid=131;",
+            "UPDATE item_stats SET play_count_user=7 WHERE item_pid=2;",
+        ] {
+            let changed = compilation_state_at(2, 14, &format!("{change}{mutation}"));
+            assert!(
+                verify_insert_batch(&before, &changed, &expected).is_err(),
+                "{mutation}"
+            );
+        }
+        assert!(
+            verify_insert_batch(
+                &before,
+                &after,
+                &[ExpectedInsert {
+                    artist_id: 8100,
+                    ..compilation_expected(&source, false)
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adopted_album_artwork_keeps_or_takes_a_planned_cover_and_rejects_other_changes() {
+        let base = "UPDATE album_artist SET album_artist='Moiré' WHERE album_artist_pid=121;";
+        let before = compilation_state(
+            1,
+            &format!("{base}{}", art(&[120], &[(2, 120, 1, 0), (131, 120, 6, 4)])),
+        );
+        let adopted = format!(
+            "{base} UPDATE album_artist SET sync_id=8100 WHERE album_artist_pid=121;
+            UPDATE album SET sync_id=9100 WHERE album_pid=131;"
+        );
+        let mut source = compilation_source("B", false);
+        source.album_artist = vec!["Moire".into()];
+        let expected = [ExpectedInsert {
+            artist_id: 8100,
+            album_id: 9100,
+            ..compilation_expected(&source, false)
+        }];
+        let covers = BTreeMap::from([(10001, 140)]);
+        let none = BTreeSet::new();
+        let check = |tokens: &[(i64, u32, i64, i64)], objects: &[u32], extra: &str| {
+            let after =
+                compilation_state_at(2, 14, &format!("{adopted}{}{extra}", art(objects, tokens)));
+            verify_insert_batch_covered(&before, &after, &expected, &none, &none, &covers)
+        };
+        for cache in [120, 140] {
+            let verified = check(
+                &[(2, 120, 1, 0), (3, 140, 1, 0), (131, cache, 6, 4)],
+                &[120, 140],
+                "",
+            )
+            .unwrap();
+            assert_eq!(verified.covers[0].album_cache_id, Some(cache));
+            assert_eq!(verified.album_identity_adoptions.len(), 1);
+        }
+        assert!(check(&[(2, 120, 1, 0), (3, 140, 1, 0)], &[120, 140], "").is_err());
+        assert!(
+            check(
+                &[(2, 120, 1, 0), (3, 140, 1, 0), (131, 130, 6, 4)],
+                &[120, 130, 140],
+                ""
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                &[(2, 140, 1, 0), (3, 140, 1, 0), (131, 140, 6, 4)],
+                &[120, 140],
+                ""
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                &[(2, 120, 1, 0), (3, 140, 1, 0), (131, 140, 6, 4)],
+                &[120, 140],
+                "UPDATE item_extra SET title='Changed' WHERE item_pid=2;"
+            )
+            .is_err()
+        );
     }
 
     #[test]

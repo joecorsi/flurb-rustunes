@@ -116,3 +116,18 @@ async fn new_observers_refuse_invalid_cancelled_and_expired_inputs_before_connec
         assert!(!trace.exists());
     }
 }
+
+
+#[test]
+fn read_only_image_verification_accepts_both_container_checksum_conventions() {
+    let mut c = cover();
+    for header in [1, music_protocol::media::artwork::MP4_CHECKSUM_HEADER] {
+        c.checksum = c.bytes.len() as u32 + header;
+        validate_cover(&c).unwrap();
+    }
+    c.checksum = c.bytes.len() as u32 + 2;
+    assert!(validate_cover(&c).is_err());
+    c.checksum = c.bytes.len() as u32 + 1;
+    c.sha256[0] ^= 1;
+    assert!(validate_cover(&c).is_err());
+}

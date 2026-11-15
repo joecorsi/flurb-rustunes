@@ -60,6 +60,17 @@ fn with_db<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> {
     }
     f(db.as_ref()?).ok()
 }
+/// Only source inspection/link publication supplies this exact complete stamp.
+pub(crate) fn remember(path: &Path, expected: &[u8], hash: [u8; 32]) {
+    if stamp(path).is_ok_and(|s| s == expected) {
+        with_db(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO hashes VALUES(?1,?2,?3)",
+                params![path.as_os_str().as_bytes(), expected, &hash[..]],
+            )
+        });
+    }
+}
 pub(crate) fn read(path: &Path, cancelled: &AtomicBool) -> Result<[u8; 32]> {
     ensure!(!cancelled.load(Ordering::Relaxed), "sync cancelled");
     let before = stamp(path)?;

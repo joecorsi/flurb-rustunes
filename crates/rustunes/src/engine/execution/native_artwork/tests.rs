@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::state::journal::{Artwork, CompletionEvidence};
-use music_protocol::media::fingerprint;
+use music_protocol::media::{artwork, fingerprint};
 use std::{
     fs,
     os::unix::fs::DirBuilderExt,
@@ -239,10 +239,26 @@ fn desired_cover_edit_preserves_transferred_audio_and_rebuilds_exact_operation()
         attempt.prepared.content.source.full_file_sha256
     );
     assert!(expected.audio == attempt.prepared.content.source.audio);
-    validate_preparation(&journal, &attempt.prepared, &state, &expected, &cover).unwrap();
+    validate_preparation(
+        &journal,
+        &attempt.prepared,
+        &state,
+        &expected.clone().into(),
+        &cover,
+    )
+    .unwrap();
     // A retagged source is not substituted for the old permanent audio hash.
     attempt.prepared.content.source = expected.clone().into();
-    assert!(validate_preparation(&journal, &attempt.prepared, &state, &expected, &cover).is_err());
+    assert!(
+        validate_preparation(
+            &journal,
+            &attempt.prepared,
+            &state,
+            &expected.clone().into(),
+            &cover
+        )
+        .is_err()
+    );
     let mut attempt = journal.attempt(id).unwrap();
     let mut value = Value::from_reader(Cursor::new(&attempt.prepared.operation)).unwrap();
     value
@@ -259,7 +275,16 @@ fn desired_cover_edit_preserves_transferred_audio_and_rebuilds_exact_operation()
     value
         .to_writer_binary(&mut attempt.prepared.operation)
         .unwrap();
-    assert!(validate_preparation(&journal, &attempt.prepared, &state, &expected, &cover).is_err());
+    assert!(
+        validate_preparation(
+            &journal,
+            &attempt.prepared,
+            &state,
+            &expected.clone().into(),
+            &cover
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -285,7 +310,14 @@ fn wrong_anchor_receipt_audio_cover_and_cache_fail_preparation() {
             _ => attempt.prepared.content.path = "iTunes_Control/Music/F39/NOPE.m4a".into(),
         }
         assert!(
-            validate_preparation(&journal, &attempt.prepared, &state, &source, &cover).is_err()
+            validate_preparation(
+                &journal,
+                &attempt.prepared,
+                &state,
+                &source.clone().into(),
+                &cover
+            )
+            .is_err()
         );
     }
 }
@@ -312,7 +344,7 @@ async fn guards_and_discovery_failure_leave_prepared_and_never_connect_on_bad_so
             ArtworkUpdate {
                 attempt: id,
                 source: &desired,
-                desired_source: &fingerprint,
+                desired_source: &fingerprint.clone().into(),
                 state: &state,
                 host_name: "Synthetic",
                 trace: &trace,
@@ -429,7 +461,7 @@ async fn interrupted_started_and_cancelled_deadline_never_open_connector() {
             ArtworkUpdate {
                 attempt: id,
                 source: &desired,
-                desired_source: &expected,
+                desired_source: &expected.clone().into(),
                 state: &state,
                 host_name: "Synthetic",
                 trace: &trace,
@@ -466,7 +498,7 @@ async fn interrupted_started_and_cancelled_deadline_never_open_connector() {
         ArtworkUpdate {
             attempt: id,
             source: &desired,
-            desired_source: &expected,
+            desired_source: &expected.clone().into(),
             state: &state,
             host_name: "Synthetic",
             trace: &trace,

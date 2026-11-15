@@ -133,7 +133,8 @@ fn validate_cover(cover: &Cover) -> Result<()> {
     );
     ensure!(
         <[u8; 32]>::from(Sha256::digest(&cover.bytes)) == cover.sha256
-            && u32::try_from(cover.bytes.len())?.checked_add(17) == Some(cover.checksum),
+            && [1, music_protocol::media::artwork::MP4_CHECKSUM_HEADER].into_iter().any(|header|
+                u32::try_from(cover.bytes.len()).ok().and_then(|bytes| bytes.checked_add(header)) == Some(cover.checksum)),
         "source cover digest or checksum mismatch"
     );
     Ok(())
@@ -971,6 +972,7 @@ where
 /// `Ok(Err(reason))` when it is not: the album registers no image this tool
 /// reads, or its original holds other bytes. An error is a failure to find
 /// out (bounds, state or transport), which shows neither.
+#[cfg(test)]
 pub async fn album_original_equal<F, Fut>(
     current: &Current,
     album_sync_id: u64,
@@ -1023,6 +1025,114 @@ where
     File::open(trace)?.sync_all()?;
     control.check()?;
     Ok(Ok(proof))
+}
+
+/// One album/cover comparison within a bounded shared connection.
+pub(crate) struct AlbumOriginalCheck {
+    pub album: u64,
+    pub expected: OriginalArtworkExpectation,
+    pub trace: PathBuf,
+}
+
+/// Compare leading album originals with one pair of catalogue guards. Results
+/// are published only after the closing guard; an unreadable image or changed
+/// phone state aborts the group without authorizing any cover replacement.
+pub(crate) async fn album_originals_equal_group<F, Fut>(
+    current: &Current,
+    checks: &[AlbumOriginalCheck],
+    trace: &Path,
+    control: &Control,
+    connect: F,
+) -> Result<Vec<std::result::Result<VerifiedAlbumOriginal, String>>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    control.check()?;
+    ensure!(!checks.is_empty(), "no album artwork checks");
+    let checks = &checks[..checks.len().min(MAX_GROUP)];
+    let mut selected = Vec::with_capacity(checks.len());
+    for check in checks {
+        check.expected.validate()?;
+        selected.push(album_registration(&current.catalog, check.album)?);
+    }
+    if selected.iter().all(|r| r.is_err()) {
+        return Ok(selected
+            .into_iter()
+            .map(|s| Err(s.err().unwrap().to_string()))
+            .collect());
+    }
+    let state = current_state(current, control, &BTreeSet::new())?;
+    let count = group_len(
+        state.state_read_chunks()?,
+        checks.iter().map(|c| c.expected.bytes),
+    );
+    ensure!(count > 0, "album artwork operation bound");
+    let checks = &checks[..count];
+    selected.truncate(count);
+    let image_ops = checks.iter().map(|c| track_ops(c.expected.bytes)).sum();
+    let mut afc = connect_guarded_ops(current, &state, trace, control, image_ops, connect).await?;
+    let mut originals = Vec::with_capacity(count);
+    for (check, selected) in checks.iter().zip(selected) {
+        control.check()?;
+        match selected {
+            Err(reason) => originals.push(Err(reason.to_string())),
+            Ok(selected) => {
+                create_trace(&check.trace)?;
+                let path = format!("{ARTWORK_ROOT}/Originals/{}", selected.relative_path);
+                let (original, _) = read_file(
+                    &mut afc,
+                    &path,
+                    &check.trace.join("album-original.jpg"),
+                    None,
+                )
+                .await?;
+                originals.push(Ok((selected.cache_id, original)));
+            }
+        }
+    }
+    state.verify_state(&mut afc).await?;
+    drop(afc);
+    let mut proofs = Vec::with_capacity(count);
+    for (check, original) in checks.iter().zip(originals) {
+        let (cache_id, original) = match original {
+            Ok(v) => v,
+            Err(e) => {
+                proofs.push(Err(e));
+                continue;
+            }
+        };
+        if original.bytes != check.expected.bytes || original.sha256 != hex(&check.expected.sha256)
+        {
+            proofs.push(Err(format!(
+                "permanent original ({} bytes, SHA-256 {}) is other bytes",
+                original.bytes, original.sha256
+            )));
+            continue;
+        }
+        let proof = VerifiedAlbumOriginal {
+            schema: "rustunes.permanent-album-original",
+            album_sync_id: format!("{:016X}", check.album),
+            cache_id,
+            media_anchor: current.catalog.persisted_media_anchor(),
+            state_receipt_sha256: hex(&current.receipt_sha256),
+            database_sha256: hex(&current.catalog.source_hashes().database),
+            wal_sha256: current.catalog.source_hashes().wal.as_ref().map(|h| hex(h)),
+            source_cover_sha256: hex(&check.expected.sha256),
+            original,
+            original_exact_source_bytes: true,
+            derivative_verified: false,
+            phone_writes: 0,
+        };
+        private_write(
+            &check.trace.join("verified-album-original.json"),
+            &serde_json::to_vec_pretty(&proof)?,
+        )?;
+        File::open(&check.trace)?.sync_all()?;
+        proofs.push(Ok(proof));
+    }
+    control.check()?;
+    Ok(proofs)
 }
 
 // This narrow seam lets offline fixtures exercise selection and real decoding

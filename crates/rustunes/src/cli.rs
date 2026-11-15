@@ -2819,6 +2819,26 @@ async fn remove(
         .ready())
 }
 
+/// Opaque, stat-bound native-source facts for our private transfer link only.
+pub struct IphoneSourceInspection(crate::engine::planning::source_reads::mpeg_cache::Inspection);
+pub fn inspect_iphone_source(path: &std::path::Path) -> Result<IphoneSourceInspection> {
+    let inspection = crate::engine::planning::source_reads::mpeg_cache::inspect_for_transfer(path)?;
+    let assessment =
+        crate::engine::planning::source_collection::mp3::preparation::assess(inspection.source());
+    let reasons: Vec<_> = assessment
+        .batch_refusals()
+        .map(|i| i.detail.as_str())
+        .collect();
+    anyhow::ensure!(reasons.is_empty(), "{}", reasons.join("; "));
+    Ok(IphoneSourceInspection(inspection))
+}
+pub fn link_iphone_source(source: &IphoneSourceInspection, target: &std::path::Path) -> Result<()> {
+    crate::engine::planning::source_reads::mpeg_cache::link_transfer(&source.0, target)
+}
+pub fn publish_iphone_source(staging: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    crate::engine::planning::source_reads::mpeg_cache::publish_transfer(staging, target)
+}
+
 /// Validate a local file against the actual native iPhone insertion profile.
 /// No device access, rewriting or insertion authority is granted.
 pub fn check_iphone_source(path: &std::path::Path) -> anyhow::Result<()> {

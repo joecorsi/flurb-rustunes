@@ -13,7 +13,7 @@ use super::{Decision, SourceDecision};
 use crate::engine::execution::flac_to_alac;
 
 /// The refusals that leave their source out.
-const LEFT_OUT: [&str; 13] = [
+const LEFT_OUT: [&str; 14] = [
     // The file itself: unreadable, changed while it was read, outside what
     // the phone takes, or a second copy of another file's audio.
     "source_inspection_failed",
@@ -22,6 +22,7 @@ const LEFT_OUT: [&str; 13] = [
     "mp3_source_profile_unsupported",
     "flac_conversion_refused",
     "duplicate_source_audio",
+    "multiple_existing_audio_matches",
     // The phone may hold it already, so adding it could make a duplicate.
     "plausible_existing_audio_requires_comparison",
     // A phone track whose source changed in a way this run does not send:

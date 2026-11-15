@@ -16,7 +16,7 @@ use crate::{
     engine::execution::native_artwork::{self, ArtworkUpdate, FreshArtworkState},
     engine::state::current::{self, hex},
     engine::state::journal::{
-        Artwork, AttemptKind, CompletionEvidence, Identity, Journal, PreparedAttempt,
+        Artwork, AttemptKind, AttemptState, CompletionEvidence, Identity, Journal, PreparedAttempt,
     },
     engine::state::snapshot,
     engine::{CoverResult, Engine, Event},
@@ -36,7 +36,7 @@ pub struct Options<'a> {
     pub host_name: &'a str,
     pub dry_run: bool,
     /// When invoked by sync, bind the cover to the exact reviewed source file.
-    pub expected_source: Option<&'a fingerprint::SourceFingerprint>,
+    pub expected_source: Option<&'a fingerprint::TransferredSource>,
     /// An album present before an add-only sync must keep its existing cover bytes.
     pub preserve_album: Option<u64>,
     /// Add-only may finish only an owned first cover, never replace a cover
@@ -54,11 +54,16 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
     let library = identity::parse(&saved.raw_preferences)?;
     let identity = Identity::for_saved_device(saved.identity.device_identifier_sha256, &library)?;
     let mut journal = Journal::open(options.journal, &identity)?;
+    if let Some(attempt) = journal.outstanding()? {
+        if attempt.state == AttemptState::Prepared && attempt.prepared.kind == AttemptKind::Artwork {
+            journal.cancel_prepared(attempt.id)?;
+        }
+    }
     ensure!(
         journal.outstanding()?.is_none(),
         "unfinished journal operation requires reconciliation before an artwork update"
     );
-    let desired = fingerprint::read(options.file)?;
+    let (desired, cover) = read_source(options.file)?;
     if let Some(expected) = options.expected_source {
         ensure!(
             &desired == expected,
@@ -68,15 +73,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
     let binding = journal
         .lookup_active_verified(&desired.audio)?
         .context("source has no active verified journal binding; verify or sync its audio first")?;
-    let source_art = artwork::read(options.file)?;
-    ensure!(
-        source_art.source_size == desired.file_bytes
-            && source_art.source_sha256 == desired.full_file_sha256,
-        "source changed during artwork inspection"
-    );
-    let cover = source_art
-        .cover
-        .context("source contains no supported embedded JPEG or PNG cover")?;
+    let cover = cover.context("source contains no supported embedded front cover")?;
     require_decoder()?;
     fs::DirBuilder::new().mode(0o700).create(options.trace)?;
     File::open(
@@ -115,7 +112,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
             crate::engine::planning::additive::owes_cover(
                 &current.catalog,
                 target.sync_id,
-                &desired,
+                &desired.require_alac()?,
                 &binding,
                 false
             ),
@@ -166,12 +163,13 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         None
     };
     let cache = native_artwork::allocate_cache_id(&current.catalog, artwork_db, &journal)?;
-    let operation = artwork_update::prepare(
+    let operation = artwork_update::prepare_for_format(
         &current.catalog,
         target.sync_id,
         cache,
         &cover,
         SystemTime::now(),
+        binding.content.source.format(),
     )?;
     let possible_recent_resets =
         artwork_verification::possible_recent_play_count_resets(&current.catalog);
@@ -239,10 +237,19 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         input_receipt_sha256: input_hash,
     })?;
     engine.emit(Event::ArtworkStarted { track_id })?;
-    let pending=native_artwork::execute(&mut journal,ArtworkUpdate{attempt,source:options.file,desired_source:&desired,state:&state,
-        host_name:options.host_name,trace:&options.trace.join("transfer")},
-        &engine.control(180),device::provider).await
-        .context("artwork update did not reach independent verification; inspect the journal before retrying")?;
+    let pending = match native_artwork::execute(&mut journal, ArtworkUpdate { attempt, source: options.file,
+        desired_source: &desired, state: &state, host_name: options.host_name,
+        trace: &options.trace.join("transfer") }, &engine.control(180), device::provider).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            // Prepared means the durable send gate was never crossed. Started
+            // attempts always retain their evidence for independent recovery.
+            if journal.attempt(attempt)?.state == AttemptState::Prepared {
+                journal.cancel_prepared(attempt)?;
+            }
+            return Err(error).context("artwork update did not reach independent verification");
+        }
+    };
     let after_control = engine.control(120);
     let after = current::capture_with_artwork_controlled(
         &options.trace.join("after"),
@@ -319,4 +326,215 @@ pub fn require_decoder() -> Result<()> {
         "FFmpeg is required for permanent artwork verification; install ffmpeg before syncing covers"
     );
     Ok(())
+}
+
+/// Read the exact desired container and its normalized native front cover.
+/// Audio identity remains codec-specific; tags and cover bytes never establish it.
+pub(crate) fn read_source(
+    path: &Path,
+) -> Result<(fingerprint::TransferredSource, Option<artwork::Cover>)> {
+    if let Ok(source) = fingerprint::read(path) {
+        let art = artwork::read(path)?;
+        ensure!(
+            art.source_size == source.file_bytes && art.source_sha256 == source.full_file_sha256,
+            "source changed during artwork inspection"
+        );
+        return Ok((source.into(), art.cover));
+    }
+    let source = crate::engine::planning::source_reads::mpeg(path)?;
+    let identity = source.transferred_identity()?;
+    let cover = music_protocol::media::mpeg::read_front_cover(path, &source)?
+        .map(|picture| {
+            artwork::sent_cover(picture.bytes(), artwork::checksum_header(source.format()))
+        })
+        .transpose()?;
+    Ok((identity, cover))
+}
+
+/// Only changed covers of exact, verified managed audio are sent. The normal
+/// cover operation rechecks live state and journals/verifies each write.
+pub(crate) async fn changed(
+    snapshot_path: &Path,
+    journal_path: &Path,
+    files: &[std::path::PathBuf],
+    trace: &Path,
+    host_name: &str,
+    engine: &Engine,
+) -> Result<usize> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let saved = snapshot::open(snapshot_path)?;
+    let library = identity::parse(&saved.raw_preferences)?;
+    let identity = Identity::for_saved_device(saved.identity.device_identifier_sha256, &library)?;
+    let mut changed = 0;
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files {
+        engine.check()?;
+        let (desired, cover) = read_source(file)?;
+        let Some(cover) = cover else {
+            continue;
+        };
+        let journal = Journal::open_read_only(journal_path, &identity)?;
+        let Some(binding) = journal.lookup_active_verified(&desired.audio)? else {
+            continue;
+        };
+        if !cover_changed(&binding.content, &cover) || !seen.insert(binding.content.track_pid) {
+            continue;
+        }
+        drop(journal);
+        crate::engine::state::layout::private_directory(trace)?;
+        engine.emit(Event::CheckingCover {
+            number: changed + 1,
+            total: files.len(),
+        })?;
+        run(
+            Options {
+                file,
+                snapshot: snapshot_path,
+                journal: journal_path,
+                trace: &trace.join(format!("cover-{:04}", changed + 1)),
+                host_name,
+                dry_run: false,
+                expected_source: Some(&desired),
+                preserve_album: None,
+                pending_cover_only: false,
+            },
+            engine,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "updating artwork for {}",
+                file.file_name().unwrap_or_default().to_string_lossy()
+            )
+        })?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+fn cover_changed(content: &crate::engine::state::journal::Content, cover: &artwork::Cover) -> bool {
+    content
+        .artwork
+        .as_ref()
+        .is_none_or(|old| old.sha256 != cover.sha256 || old.bytes != cover.bytes.len() as u64)
+}
+
+#[cfg(test)]
+mod changed_tests {
+    use super::*;
+    use crate::engine::state::journal::{Artwork, Content};
+    fn mp3(path: &Path, jpeg: &[u8]) {
+        let picture = [b"\0image/jpeg\0\x03\0".as_slice(), jpeg].concat();
+        let frame = [
+            b"APIC".as_slice(),
+            &(picture.len() as u32).to_be_bytes(),
+            &[0, 0],
+            &picture,
+        ]
+        .concat();
+        let n = frame.len();
+        let size = [
+            ((n >> 21) & 127) as u8,
+            ((n >> 14) & 127) as u8,
+            ((n >> 7) & 127) as u8,
+            (n & 127) as u8,
+        ];
+        fs::write(
+            path,
+            [
+                b"ID3\x03\0\0".as_slice(),
+                &size,
+                &frame,
+                &music_protocol::test_support::mpeg::audio(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn changed_mp3_cover_keeps_audio_identity_and_skips_unchanged_jpeg() {
+        let root = std::env::temp_dir().join(format!(
+            "cover-change-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let first = root.join("first.mp3");
+        let second = root.join("second.mp3");
+        let jpeg = |color: &str| {
+            let output = std::process::Command::new("ffmpeg")
+                .env_remove("FFREPORT")
+                .args([
+                    "-nostdin",
+                    "-hide_banner",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    color,
+                    "-frames:v",
+                    "1",
+                    "-threads",
+                    "1",
+                    "-c:v",
+                    "mjpeg",
+                    "-f",
+                    "image2pipe",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        mp3(&first, &jpeg("color=c=red:s=8x8"));
+        mp3(&second, &jpeg("color=c=blue:s=8x8"));
+        let mut bytes = fs::read(&second).unwrap();
+        let size = bytes[6..10].iter().fold(0usize, |n, &b| (n << 7) | usize::from(b));
+        bytes.splice(10 + size..10 + size, [0u8; 512]);
+        let size = size + 512;
+        bytes[6..10].copy_from_slice(&[((size >> 21) & 127) as u8, ((size >> 14) & 127) as u8, ((size >> 7) & 127) as u8, (size & 127) as u8]);
+        fs::write(&second, bytes).unwrap();
+        let (old, original) = read_source(&first).unwrap();
+        let (desired, replacement) = read_source(&second).unwrap();
+        assert!(old.audio != desired.audio); // includes the shifted ID3/audio offset
+        assert!(native_artwork::same_encoded_audio(&desired, &old).unwrap());
+        let mut different = desired.clone(); different.audio.sha256[0] ^= 1;
+        assert!(native_artwork::same_encoded_audio(&different, &old).is_err());
+        assert_ne!(old.full_file_sha256, desired.full_file_sha256);
+        let original = original.unwrap();
+        let replacement = replacement.unwrap();
+        let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
+        // Exercise the real builder too: an MP3 must not be subjected to the
+        // old ALAC-only checksum check after its cover has been read correctly.
+        artwork_update::prepare_for_format(&catalog, catalog.tracks()[0].sync_id, 100,
+            &replacement, SystemTime::UNIX_EPOCH, desired.format()).unwrap();
+        let mut content = Content {
+            source: old.clone(),
+            track_pid: 1001,
+            path: "iTunes_Control/Music/F00/TEST.mp3".into(),
+            artwork: Some(Artwork {
+                cache_id: 1,
+                bytes: original.bytes.len() as u64,
+                sha256: original.sha256,
+            }),
+            collection: None,
+        };
+        assert!(!cover_changed(&content, &original));
+        assert!(cover_changed(&content, &replacement));
+        content.artwork = Some(Artwork {
+            cache_id: 2,
+            bytes: replacement.bytes.len() as u64,
+            sha256: replacement.sha256,
+        });
+        assert!(!cover_changed(&content, &replacement));
+        assert!(content.source == old); // artwork never substitutes the phone audio container
+        fs::remove_dir_all(root).unwrap();
+    }
 }

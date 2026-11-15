@@ -128,7 +128,7 @@ fn operation(
     }
     if let Some(art) = &content.artwork {
         item.insert("artwork_cache_id".into(), art.cache_id.into());
-        item.insert("artwork_checksum".into(), (art.bytes + 17).into());
+        item.insert("artwork_checksum".into(), (art.bytes + u64::from(music_protocol::media::artwork::checksum_header(content.source.format()))).into());
     }
     let mut own = Dictionary::new();
     own.insert(
@@ -1058,3 +1058,36 @@ mod bindings_tests;
 mod mpeg_tests;
 
 mod carry_tests;
+
+
+#[test]
+fn mp3_artwork_journal_requires_payload_checksum_and_rejects_mp4_header() {
+    let temp = Temp::new();
+    let mut journal = Journal::create(&temp.journal(), &scope()).unwrap();
+    let path = temp.0.join("source.mp3");
+    std::fs::write(&path, music_protocol::test_support::mpeg::audio()).unwrap();
+    let source = music_protocol::media::mpeg::read(&path).unwrap().transferred_identity().unwrap();
+    let mut original = content(1);
+    original.source = source;
+    original.path = "iTunes_Control/Music/F39/AAAA.mp3".into();
+    test_support::mpeg_verified_readback_fixture(&mut journal, original.clone(), 12);
+    let mut desired = original.clone();
+    desired.artwork = Some(Artwork { cache_id: 677, bytes: 1000, sha256: [10;32] });
+    let valid_operation = operation(AttemptKind::Artwork, &desired, 13, None, None);
+    let prepared = |operation| PreparedAttempt { kind: AttemptKind::Artwork, content: desired.clone(),
+        new_album_pid: None, new_artist_pid: None, current_media_anchor: 13, operation,
+        input_receipt_sha256: [7;32] };
+    let mut bad = plist::Value::from_reader(std::io::Cursor::new(&valid_operation)).unwrap();
+    bad.as_dictionary_mut().unwrap().get_mut("operations").unwrap().as_array_mut().unwrap()[1]
+        .as_dictionary_mut().unwrap().get_mut("item").unwrap().as_dictionary_mut().unwrap()
+        .insert("artwork_checksum".into(), 1017u64.into());
+    let mut bytes = Vec::new(); bad.to_writer_binary(&mut bytes).unwrap();
+    assert!(journal.prepare(prepared(bytes)).is_err());
+    assert!(journal.outstanding().unwrap().is_none());
+    let id = journal.prepare(prepared(valid_operation)).unwrap();
+    let permit = journal.mark_started(id, start(13)).unwrap();
+    journal.complete(permit, verified(&desired, 14)).unwrap();
+    let updated = journal.active_verified_bindings().unwrap().remove(0).content;
+    assert!(updated == desired);
+    assert!(updated.source == original.source);
+}

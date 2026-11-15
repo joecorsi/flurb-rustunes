@@ -657,7 +657,9 @@ impl Journal {
     pub fn prepare(&mut self, prepared: PreparedAttempt) -> Result<AttemptId> {
         self.ordinary_usable()?;
         validate_prepared(&prepared)?;
-        prepared.content.source.require_alac()?;
+        if prepared.kind == AttemptKind::Insert {
+            prepared.content.source.require_alac()?;
+        }
         let content = encode_content(&prepared.content)?;
         let operation_sha: [u8; 32] = Sha256::digest(&prepared.operation).into();
         let transaction = self
@@ -764,7 +766,9 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let attempt = load_attempt(&transaction, id)?;
-        attempt.prepared.content.source.require_alac()?;
+        if attempt.prepared.kind == AttemptKind::Insert {
+            attempt.prepared.content.source.require_alac()?;
+        }
         ensure!(
             attempt.state == AttemptState::Prepared,
             "attempt already started or closed; reconcile instead of retrying"
@@ -828,7 +832,11 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let attempt = load_attempt(&transaction, id)?;
-        attempt.prepared.content.source.require_alac()?; // Storage decoding is not start/completion authority.
+        // Non-ALAC audio still enters only through verified insert batches.
+        // Artwork updates preserve that existing audio container byte-for-byte.
+        if attempt.prepared.kind == AttemptKind::Insert {
+            attempt.prepared.content.source.require_alac()?;
+        }
         ensure!(
             attempt.state == AttemptState::ReconciliationRequired,
             "only Started attempts may be verified"
@@ -1489,10 +1497,6 @@ fn verify_content(content: &Content, evidence: &CompletionEvidence) -> Result<()
 
 fn validate_prepared(prepared: &PreparedAttempt) -> Result<()> {
     validate_content(&prepared.content)?;
-    ensure!(
-        prepared.content.source.is_alac() || prepared.kind == AttemptKind::Insert,
-        "MPEG artwork intent is not qualified"
-    );
     nonzero_hash(&prepared.input_receipt_sha256)?;
     let revision = prepared
         .current_media_anchor
@@ -1609,7 +1613,7 @@ fn validate_prepared(prepared: &PreparedAttempt) -> Result<()> {
                     && item
                         .get("artwork_checksum")
                         .and_then(Value::as_unsigned_integer)
-                        == art.bytes.checked_add(17),
+                        == art.bytes.checked_add(u64::from(music_protocol::media::artwork::checksum_header(prepared.content.source.format()))),
                 "unsupported artwork-only operation"
             );
         }

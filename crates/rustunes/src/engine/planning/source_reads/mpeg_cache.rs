@@ -175,6 +175,13 @@ pub(crate) fn read(path: &Path) -> Result<Source> {
         if let Some(s) = cached
             && key(path).as_ref() == Some(k)
         {
+            if let Ok(mut memory) = MEMORY.lock() {
+                let memory = memory.get_or_insert_default();
+                if memory.len() >= 4096 {
+                    memory.clear();
+                }
+                memory.insert(k.clone(), s.clone());
+            }
             return Ok(s);
         }
     }
@@ -244,5 +251,157 @@ mod tests {
         assert_eq!(read(&p).unwrap(), first);
         std::fs::write(&p, b"damaged").unwrap();
         assert!(read(&p).is_err());
+    }
+}
+
+/// An inspection bound to the exact regular source observed before our own
+/// link/copy operation. Fields stay private: callers cannot invent cache facts.
+pub(crate) struct Inspection {
+    path: PathBuf,
+    key: Key,
+    source: Source,
+}
+impl Inspection {
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+}
+pub(crate) fn inspect_for_transfer(path: &Path) -> Result<Inspection> {
+    let before = key(path).ok_or_else(|| anyhow::anyhow!("source is not a regular file"))?;
+    let source = read(path)?;
+    ensure!(
+        key(path).as_ref() == Some(&before),
+        "source changed during transfer inspection"
+    );
+    Ok(Inspection {
+        path: path.to_owned(),
+        key: before,
+        source,
+    })
+}
+fn same_content_stamp(a: &Key, b: &Key) -> bool {
+    a.dev == b.dev && a.ino == b.ino && a.size == b.size && a.mtime == b.mtime
+}
+fn remember(path: &Path, source: &Source) -> Result<()> {
+    let k = key(path).ok_or_else(|| anyhow::anyhow!("transfer alias is not a regular file"))?;
+    ensure!(
+        k.size == source.fingerprint.file_bytes,
+        "transfer alias size differs"
+    );
+    let mut source = source.clone();
+    if source.fallback_title.is_some() {
+        source.fallback_title = path.file_stem().and_then(|v| v.to_str()).map(str::to_owned);
+    }
+    if let Some(d) = DISK.get() {
+        d.store(&k, &source);
+    }
+    if let Ok(mut memory) = MEMORY.lock() {
+        let memory = memory.get_or_insert_default();
+        if memory.len() >= 4096 {
+            memory.clear();
+        }
+        memory.insert(k.clone(), source.clone());
+    }
+    crate::engine::planning::file_hashes::remember(
+        path,
+        &k.stat(),
+        source.transferred_identity()?.full_file_sha256,
+    );
+    ensure!(
+        key(path).as_ref() == Some(&k),
+        "transfer alias changed while retaining inspection"
+    );
+    Ok(())
+}
+pub(crate) fn link_transfer(inspection: &Inspection, target: &Path) -> Result<()> {
+    ensure!(
+        key(&inspection.path).as_ref() == Some(&inspection.key),
+        "source changed before transfer link"
+    );
+    ensure!(
+        matches!(std::fs::symlink_metadata(target),Err(e) if e.kind()==std::io::ErrorKind::NotFound),
+        "transfer staging path already exists"
+    );
+    let linked = std::fs::hard_link(&inspection.path, target).is_ok();
+    if !linked {
+        let input = std::fs::File::open(&inspection.path)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        let mut input = std::io::Read::take(input, inspection.key.size + 1);
+        ensure!(
+            std::io::copy(&mut input, &mut output)? == inspection.key.size,
+            "transfer copy size differs"
+        );
+    }
+    let after = key(&inspection.path)
+        .ok_or_else(|| anyhow::anyhow!("source disappeared during transfer link"))?;
+    ensure!(
+        if linked {
+            same_content_stamp(&inspection.key, &after)
+        } else {
+            after == inspection.key
+        },
+        "source changed during transfer link"
+    );
+    let target_key = key(target).ok_or_else(|| anyhow::anyhow!("transfer link disappeared"))?;
+    ensure!(
+        target_key.size == after.size && (!linked || same_content_stamp(&after, &target_key)),
+        "transfer link identity differs"
+    );
+    // This is only inspection reuse. The actual upload still hashes every byte
+    // against the prepared full-file digest before completing the native asset.
+    remember(&inspection.path, &inspection.source)?;
+    remember(target, &inspection.source)
+}
+pub(crate) fn publish_transfer(staging: &Path, target: &Path) -> Result<()> {
+    let inspection = inspect_for_transfer(staging)?;
+    std::fs::File::open(staging)?.sync_all()?;
+    ensure!(
+        key(staging).as_ref() == Some(&inspection.key),
+        "staging changed before publication"
+    );
+    std::fs::rename(staging, target)?;
+    let after = key(target).ok_or_else(|| anyhow::anyhow!("published transfer disappeared"))?;
+    ensure!(
+        same_content_stamp(&inspection.key, &after),
+        "published transfer identity differs"
+    );
+    remember(target, &inspection.source)
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    #[test]
+    fn transfer_link_and_publish_reuse_facts_and_invalidate_on_external_changes() {
+        let root = std::env::temp_dir().join(format!("mpeg-transfer-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let original = root.join("original.mp3");
+        let staging = root.join("staging.mp3");
+        let target = root.join("published.mp3");
+        std::fs::write(&original, music_protocol::test_support::mpeg::audio()).unwrap();
+        let inspection = inspect_for_transfer(&original).unwrap();
+        let bytes = std::fs::read(&original).unwrap();
+        link_transfer(&inspection, &staging).unwrap();
+        publish_transfer(&staging, &target).unwrap();
+        let k = key(&target).unwrap();
+        assert!(MEMORY.lock().unwrap().as_ref().unwrap().contains_key(&k));
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        let observed = read(&target).unwrap();
+        assert_eq!(observed.fingerprint, inspection.source.fingerprint);
+        assert_eq!(observed.fallback_title.as_deref(), Some("published"));
+        std::fs::write(&target, b"changed").unwrap();
+        assert!(read(&target).is_err());
+        assert!(link_transfer(&inspection, &root.join("stale.mp3")).is_err());
+        let broken = root.join("broken.mp3");
+        std::os::unix::fs::symlink(root.join("absent"), &broken).unwrap();
+        // A fresh source must not overwrite or follow an existing staging link.
+        std::fs::write(&original, &bytes).unwrap();
+        let fresh = inspect_for_transfer(&original).unwrap();
+        assert!(link_transfer(&fresh, &broken).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

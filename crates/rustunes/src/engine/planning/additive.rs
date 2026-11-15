@@ -692,7 +692,7 @@ fn build_inner_with_control(
                 for track in catalog
                     .tracks()
                     .iter()
-                    .filter(|track| plausible(&projected, track))
+                    .filter(|track| present_audio(index, track.sync_id) && plausible(&projected, track))
                 {
                     row.matches.push(existing_match(
                         source,
@@ -815,11 +815,11 @@ fn build_inner_with_control(
                                 prepared.source().format().label()
                             ),
                         )
-                    } else if let Some(plausible) = plausible_mpeg(&prepared, catalog) {
+                    } else if let Some(plausible) = plausible_mpeg(&prepared, catalog, index) {
                         conflict(
                             "plausible_existing_audio_requires_comparison",
                             format!(
-                                "Encoded mismatch is not absence: track {plausible} has this source's title, its artist or album and its duration; it may be an earlier version of it. Titles establish no identity, so nothing is added"
+                                "Encoded mismatch is not absence: track {plausible} has this source's title, artist, album and duration, but different encoded audio. Metadata alone does not establish a duplicate, so this candidate needs review"
                             ),
                         )
                     } else if let Some(candidate) = candidates.get(&source.relative_path) {
@@ -992,6 +992,18 @@ fn build_inner_with_control(
     })
 }
 
+fn duplicate_mpeg(
+    sources: &SourceCollection,
+    source: &crate::engine::planning::source_collection::Mp3Track,
+) -> bool {
+    sources
+        .mp3_tracks
+        .iter()
+        .filter(|t| t.source.fingerprint.audio == source.source.fingerprint.audio)
+        .count()
+        > 1
+}
+
 /// Full-file equality proves the same MPEG bytes; the device index records no
 /// MPEG frame digest. No tag-only audio equality is inferred here.
 fn mp3_row(
@@ -1012,12 +1024,7 @@ fn mp3_row(
         &sources.base_directory.join(&source.relative_path),
     );
     let revalidated = fresh.as_ref().is_ok_and(|s| s == &source.source);
-    let duplicate = sources
-        .mp3_tracks
-        .iter()
-        .filter(|t| t.source.fingerprint.audio == f.audio)
-        .count()
-        > 1;
+    let duplicate = duplicate_mpeg(sources, source);
     // A track this tool inserted from the same frames, whose source has since
     // changed only outside them (its tags or cover): the phone still holds the
     // file that was sent, and its catalogue fields can follow the new tags.
@@ -1572,12 +1579,7 @@ pub(crate) fn uninsertable_sources(sources: &SourceCollection) -> Vec<(String, S
     }
     for source in &sources.mp3_tracks {
         let path = sources.base_directory.join(&source.relative_path);
-        let duplicate = sources
-            .mp3_tracks
-            .iter()
-            .filter(|t| t.source.fingerprint.audio == source.source.fingerprint.audio)
-            .count()
-            > 1;
+        let duplicate = duplicate_mpeg(sources, source);
         let refusal = unconvertible(sources, &source.source)
             .or_else(|| {
                 crate::engine::planning::source_reads::mpeg(&path)
@@ -1873,7 +1875,7 @@ fn differences(s: &ProjectedFields, track: &Track) -> Vec<FieldDifference> {
 
 /// A catalogue track an MP3 with no matching audio might be an earlier
 /// version of, by the same rule as `plausible`.
-fn plausible_mpeg(source: &PreparedSource, catalog: &Catalog) -> Option<String> {
+fn plausible_mpeg(source: &PreparedSource, catalog: &Catalog, index: &DeviceAudioIndex) -> Option<String> {
     let assessment = source.assessment();
     let (metadata, timing) = (
         assessment.metadata.as_ref()?,
@@ -1884,8 +1886,12 @@ fn plausible_mpeg(source: &PreparedSource, catalog: &Catalog) -> Option<String> 
         .iter()
         .find(|track| {
             let m = &track.metadata;
-            same_name(&metadata.title, &m.title)
-                && (same_name(&metadata.artist, &m.artist) || same_name(&metadata.album, &m.album))
+            present_audio(index, track.sync_id)
+                && !metadata.title.trim().is_empty()
+                && !metadata.artist.trim().is_empty()
+                && same_name(&metadata.title, &m.title)
+                && same_release(&metadata.album, &m.album)
+                && same_name(&metadata.artist, &m.artist)
                 && timing
                     .total_time_ms_floor
                     .abs_diff(u64::from(m.total_time_ms))
@@ -1894,10 +1900,24 @@ fn plausible_mpeg(source: &PreparedSource, catalog: &Catalog) -> Option<String> 
         .map(|track| pid(track.sync_id))
 }
 
+// Cloud/catalogue-only rows cannot establish that music is installed locally.
+fn present_audio(index: &DeviceAudioIndex, track: u64) -> bool {
+    index.tracks().contains_key(&track) || index.other_audio().contains_key(&track)
+}
+
+// Similar titles and lengths on different releases are separate library entries.
+// A blank album cannot establish release identity.
+fn same_release(source: &str, phone: &str) -> bool {
+    !source.trim().is_empty() && !phone.trim().is_empty() && same_name(source, phone)
+}
+
 fn plausible(source: &ProjectedFields, track: &Track) -> bool {
     let m = &track.metadata;
-    same_name(&source.title, &m.title)
-        && (same_name(&source.artist, &m.artist) || same_name(&source.album, &m.album))
+    !source.title.trim().is_empty()
+        && !source.artist.trim().is_empty()
+        && same_name(&source.title, &m.title)
+        && same_release(&source.album, &m.album)
+        && same_name(&source.artist, &m.artist)
         && source.total_time_ms.abs_diff(u64::from(m.total_time_ms)) <= 1000
 }
 

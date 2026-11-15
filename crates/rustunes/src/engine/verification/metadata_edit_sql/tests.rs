@@ -555,6 +555,53 @@ fn favorites_allow_only_same_artist_representative_reselection() {
     }
 }
 
+#[test]
+fn favorites_allow_only_reselection_within_a_touched_album() {
+    for variant in 0..7 {
+        let world = World::new();
+        for path in [&world.fixture.before, &world.fixture.after] {
+            Connection::open(path)
+                .unwrap()
+                .execute_batch("UPDATE item_stats SET liked_state=0 WHERE item_pid=3")
+                .unwrap();
+        }
+        let before = world.before();
+        let mut phone = Phone::new();
+        phone.sql("UPDATE item_stats SET liked_state=2 WHERE item_pid=3; UPDATE album SET representative_item_pid=4 WHERE album_pid=11;");
+        match variant {
+            1 => {
+                phone.sql("UPDATE album SET representative_item_pid=1 WHERE album_pid=11;");
+            }
+            2 => {
+                phone.sql("UPDATE album SET representative_item_pid=0 WHERE album_pid=11;");
+            }
+            3 => {
+                phone.sql("UPDATE album SET representative_item_pid=999 WHERE album_pid=11;");
+            }
+            4 => {
+                phone.sql("UPDATE item SET album_pid=10 WHERE item_pid=4;");
+            }
+            5 => {
+                phone.sql("UPDATE album SET album='Changed name' WHERE album_pid=11;");
+            }
+            6 => {
+                phone.sql("UPDATE album SET representative_item_pid=1 WHERE album_pid=10;");
+            }
+            _ => {}
+        }
+        phone.revise(0, 3);
+        let after = world.after(&phone.finish());
+        for later in [false, true] {
+            let result = verify_favorites(&before, &after, &[(1003, 0, 2)], ANCHOR_BEFORE, later);
+            if variant == 0 {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(result.is_err(), "accepted unrelated change {variant}");
+            }
+        }
+    }
+}
+
 /// Seen on the phone: an album an insert batch killed mid-upload had left at
 /// keep_local_status 0, outside the edit, went to 2; its revision moved one
 /// above the session's own block and its stats revision row went.

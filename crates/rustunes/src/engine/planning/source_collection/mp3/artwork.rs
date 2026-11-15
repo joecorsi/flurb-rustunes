@@ -19,11 +19,7 @@ pub(crate) fn batch_cover(
     };
     music_protocol::media::artwork::sent_cover(
         cover.bytes(),
-        if source.format().mp4() {
-            music_protocol::media::artwork::MP4_CHECKSUM_HEADER
-        } else {
-            1
-        },
+        music_protocol::media::artwork::checksum_header(source.format()),
     )
     .map(Some)
 }

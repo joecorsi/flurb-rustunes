@@ -158,10 +158,9 @@ fn every_refusal_about_one_file_is_left_out_and_every_other_holds_the_run() {
         .collect();
     // These hold the run: the journal, the phone's state, or groups other
     // sources share.
-    const HOLDING: [&str; 11] = [
+    const HOLDING: [&str; 10] = [
         "journal_reconciliation_required",
         "mp3_journal_required",
-        "multiple_existing_audio_matches",
         "device_mpeg_classification_conflict",
         "composer_lookup_unqualified",
         "candidate_or_grouping_conflict",

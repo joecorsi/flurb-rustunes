@@ -352,6 +352,8 @@ pub(crate) fn outstanding_sources(journal: &Journal) -> Result<Vec<PathBuf>> {
 
 /// What a batch ended as.
 pub(crate) struct Settled {
+    /// Exact verified after-state, reusable only within this running transfer.
+    next_before: Option<Before>,
     pub(crate) batch: InsertBatchId,
     pub(crate) state: InsertBatchState,
     pub(crate) evidence: PathBuf,
@@ -704,6 +706,25 @@ pub(crate) async fn run(
 
 /// Hold every member's source: the operation binds these bytes.
 pub(crate) fn hold(members: &[Member]) -> Result<Vec<BoundSource>> {
+    let required = members.len().saturating_add(128) as libc::rlim_t;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Raising this process's soft limit never changes the system/hard limit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 && limit.rlim_cur < required
+    {
+        ensure!(
+            limit.rlim_max >= required,
+            "open-file limit cannot hold the requested sync batch"
+        );
+        limit.rlim_cur = required.max(1024).min(limit.rlim_max);
+        ensure!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0,
+            "could not reserve file handles for sync: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     members.iter().map(|m| m.audio.open(&m.source)).collect()
 }
 
@@ -957,7 +978,7 @@ pub(crate) async fn send_session<T: session::StartedOperation>(
             if let Some(operations) = upload_connections[index] {
                 let trace = evidence.join(format!("upload-{}", member.asset_id()));
                 create_trace(&trace)?;
-                let mut afc = Transfer::connect_bounded(
+                let mut afc = Transfer::connect_bounded_upload(
                     &provider,
                     &trace,
                     control.deadline,
@@ -1028,10 +1049,15 @@ pub(crate) async fn send_session<T: session::StartedOperation>(
                         .await?
                 }
             }
-            uploaded.push(
-                json!({"track":format!("{:016x}",member.track),"sha256":hex(&sent),
-                "cover_sha256":member.cover.as_ref().map(|c| hex(&c.sha256))}),
-            );
+            let completed = json!({"track":format!("{:016x}",member.track),"sha256":hex(&sent),
+                "bytes":bytes,"destination":member.destination,
+                "cover_sha256":member.cover.as_ref().map(|c| hex(&c.sha256))});
+            durable_write(
+                trace,
+                &format!("uploaded-{:016x}.json", member.track),
+                &serde_json::to_vec(&completed)?,
+            )?;
+            uploaded.push(completed);
             sync_trace(trace)?;
         }
         drop(upload);
@@ -1133,6 +1159,7 @@ pub(crate) async fn add_all(
         }
     };
     let mut settled = Vec::new();
+    let mut next_before = None;
     let mut inserted = 0;
     let mut removed = 0;
     let mut start = 0;
@@ -1172,7 +1199,10 @@ pub(crate) async fn add_all(
         // A removal target's file may be gone after an earlier removal of it
         // that the phone rolled back.
         let before = match removals.is_empty() {
-            true => removal_batch::capture_before(&directory, identity, &control).await?,
+            true => match next_before.take() {
+                Some(before) => removal_batch::retain_before(before, &directory, &control)?,
+                None => removal_batch::capture_before(&directory, identity, &control).await?,
+            },
             false => {
                 let taken = removal_batch::taken(journal_path, identity)?;
                 removal_batch::capture_for_removal(&directory, identity, &taken, &control).await?
@@ -1192,7 +1222,7 @@ pub(crate) async fn add_all(
         let chunk = &*chunk;
         let mut journal = Journal::open(journal_path, identity)?;
         let session = std::mem::take(&mut removals);
-        let batch = run(
+        let mut batch = run(
             &mut journal,
             identity,
             &before,
@@ -1271,6 +1301,7 @@ pub(crate) async fn add_all(
         );
         inserted += batch.inserted;
         progress(&batch, inserted, total)?;
+        next_before = batch.next_before.take();
         settled.push(batch);
     }
     if !removals.is_empty() {
@@ -1312,45 +1343,59 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<device::DeviceProvider>>,
 {
+    use crate::engine::verification::artwork::{
+        AlbumOriginalCheck, OriginalArtworkExpectation, album_originals_equal_group,
+    };
     let mut proofs = BTreeMap::new();
+    let mut checks = Vec::new();
+    let mut keys = BTreeSet::new();
+    for member in chunk.iter().filter(|m| m.keep_album_image) {
+        let Some(cover) = &member.cover else { continue };
+        if keys.insert((member.album, cover.sha256)) {
+            checks.push(AlbumOriginalCheck {
+                album: member.album,
+                expected: OriginalArtworkExpectation {
+                    bytes: cover.bytes.len() as u64,
+                    sha256: cover.sha256,
+                },
+                trace: directory.join(format!("album-image-{:03}", checks.len() + 1)),
+            });
+        }
+    }
+    let mut done = 0;
+    while done < checks.len() {
+        let group_control = Control {
+            deadline: control
+                .deadline
+                .min(Instant::now() + Duration::from_secs(120)),
+            cancelled: Arc::clone(&control.cancelled),
+        };
+        let results = album_originals_equal_group(
+            current,
+            &checks[done..],
+            &directory.join(format!("album-image-group-{done:03}")),
+            &group_control,
+            &connect,
+        )
+        .await
+        .context("album images could not be read; nothing was sent in this batch")?;
+        ensure!(!results.is_empty(), "empty album image group");
+        for (check, result) in checks[done..].iter().zip(results.iter()) {
+            proofs.insert(
+                (check.album, check.expected.sha256),
+                result.as_ref().map(|_| ()).map_err(Clone::clone),
+            );
+        }
+        done += results.len();
+    }
     let mut record = Vec::new();
     let mut cleared = Vec::new();
     for (index, member) in chunk.iter_mut().enumerate() {
         if !member.keep_album_image {
             continue;
         }
-        let Some(cover) = &member.cover else {
-            continue;
-        };
+        let Some(cover) = &member.cover else { continue };
         let key = (member.album, cover.sha256);
-        if !proofs.contains_key(&key) {
-            // Each read has its own 120-second bound.
-            let read_control = Control {
-                deadline: control
-                    .deadline
-                    .min(Instant::now() + Duration::from_secs(120)),
-                cancelled: Arc::clone(&control.cancelled),
-            };
-            let equal = crate::engine::verification::artwork::album_original_equal(
-                current,
-                member.album,
-                &crate::engine::verification::artwork::OriginalArtworkExpectation {
-                    bytes: cover.bytes.len() as u64,
-                    sha256: cover.sha256,
-                },
-                &directory.join(format!("album-image-{:03}", proofs.len() + 1)),
-                &read_control,
-                &connect,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "the image of the album {} joins could not be read; nothing was sent in this batch",
-                    member.relative_path
-                )
-            })?;
-            proofs.insert(key, equal.map(|_| ()));
-        }
         let equal = &proofs[&key];
         record.push(json!({
             "source":member.relative_path,"album":format!("{:016x}",member.album),
@@ -1768,6 +1813,7 @@ async fn settle_with(
             None => journal.mark_insert_batch_not_applied(batch.id, sha(&proof))?,
         }
         return Ok(Settled {
+            next_before: None,
             batch: batch.id,
             state: InsertBatchState::NotApplied,
             evidence: run,
@@ -1935,10 +1981,10 @@ async fn settle_with(
             })
         })
         .collect();
-    let permanent_covers = if checks.is_empty() {
-        Vec::new()
+    let (permanent_covers, verified_current) = if checks.is_empty() {
+        (Vec::new(), None)
     } else {
-        verify_covers(&after, &run, identity, &checks, &locationless, control)
+        let verified = verify_covers(&after, &run, identity, &checks, &locationless, control)
             .await
             .with_context(|| {
                 format!(
@@ -1946,7 +1992,8 @@ async fn settle_with(
                     batch.id.as_i64(),
                     run.display()
                 )
-            })?
+            })?;
+        (verified.proofs, Some(verified.current))
     };
     let mut receipt = json!({
         "schema":"rustunes.insert-batch-verification","batch":batch.id.as_i64(),
@@ -2016,7 +2063,24 @@ async fn settle_with(
         )?,
         None => journal.settle_insert_batch(batch.id, receipt_sha, anchor, &evidence, &removed)?,
     };
+    let next_before = if state == InsertBatchState::Verified {
+        match verified_current {
+            Some(current) => {
+                let sql = removal_batch::materialize(&after, &run.join("sql-next"), control)?;
+                Some(Before {
+                    directory: run.clone(),
+                    snapshot: after,
+                    current,
+                    sql,
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     Ok(Settled {
+        next_before,
         batch: batch.id,
         state,
         evidence: run,
@@ -2028,6 +2092,11 @@ async fn settle_with(
 /// Read back each bound target's permanent cover over a capture of the same
 /// after state, as `verify` does: the exact original and a decodable
 /// derivative. Proofs come back in `checks` order.
+struct VerifiedCovers {
+    proofs: Vec<crate::engine::verification::artwork::VerifiedTrackArtworkBytes>,
+    current: current::Current,
+}
+
 async fn verify_covers(
     after: &Snapshot,
     run: &Path,
@@ -2035,7 +2104,7 @@ async fn verify_covers(
     checks: &[TrackCheck],
     locationless: &BTreeSet<u64>,
     control: &Control,
-) -> Result<Vec<crate::engine::verification::artwork::VerifiedTrackArtworkBytes>> {
+) -> Result<VerifiedCovers> {
     cover::require_decoder()?;
     let current = current::capture_with_artwork_controlled(
         &run.join("current"),
@@ -2084,7 +2153,7 @@ async fn verify_covers(
         })?;
         proofs.extend(group);
     }
-    Ok(proofs)
+    Ok(VerifiedCovers { proofs, current })
 }
 
 /// The journal names the collections the batch created; every target must be

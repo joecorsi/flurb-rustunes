@@ -1109,10 +1109,10 @@ pub(crate) fn verify_favorites(
     )
 }
 
-/// iOS may reselect an artist representative while applying favorites. It is
-/// bookkeeping only: the new representative must be an existing member of the
-/// same artist before and after, and the artist must contain an edited track.
-/// No names, membership, other group fields or untouched artists are absorbed.
+/// iOS may reselect a group representative while applying favorites. The
+/// replacement must already belong to that same group before and after, and
+/// the group must contain an edited track. Names, membership, other fields,
+/// and groups without edited tracks remain exact.
 fn absorb_favorite_representatives(
     expected: &mut Tables,
     before: &Tables,
@@ -1122,6 +1122,7 @@ fn absorb_favorite_representatives(
     for (name, key) in [
         ("album_artist", "album_artist_pid"),
         ("item_artist", "item_artist_pid"),
+        ("album", "album_pid"),
     ] {
         let items = table(before, "item")?;
         let mut groups = BTreeSet::new();
@@ -1148,7 +1149,7 @@ fn absorb_favorite_representatives(
                 chosen != 0
                     && typed::int(items, items.one("item_pid", chosen)?, key)? == group
                     && typed::int(after_items, after_items.one("item_pid", chosen)?, key)? == group,
-                "favorite representative is outside its original artist group"
+                "favorite representative is outside its original group"
             );
             original.set("representative_item_pid", int(chosen))?;
             original.store(expected)?;

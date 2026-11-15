@@ -139,10 +139,26 @@ fn favorite_write(state: u32, desired: bool) -> Option<u32> {
     let current = phone_favorite(state)?;
     (current != desired).then_some(if desired { 2 } else { 1 })
 }
+const FAVORITE_BATCH_SIZE: usize = music_protocol::protocol::operations::MAX_OPERATIONS - 1;
 fn encode(before: &Before, changes: &[Change]) -> Result<Vec<u8>> {
-    use music_protocol::catalogue::metadata_edit::{Envelope, TrackUpdate};
+    use music_protocol::catalogue::metadata_edit::Envelope;
+    encode_changes(
+        &Envelope {
+            database_pid: before.current.catalog.database_pid(),
+            primary_container_pid: before.current.catalog.primary_container_pid(),
+            revision: before.anchor().checked_add(1).context("anchor exhausted")?,
+            timestamp: SystemTime::now(),
+        },
+        changes,
+    )
+}
+fn encode_changes(
+    envelope: &music_protocol::catalogue::metadata_edit::Envelope,
+    changes: &[Change],
+) -> Result<Vec<u8>> {
+    use music_protocol::catalogue::metadata_edit::TrackUpdate;
     ensure!(
-        !changes.is_empty() && changes.len() <= 500,
+        !changes.is_empty() && changes.len() <= FAVORITE_BATCH_SIZE,
         "favorite batch exceeds bound"
     );
     let seed: Vec<_> = changes
@@ -152,15 +168,7 @@ fn encode(before: &Before, changes: &[Change]) -> Result<Vec<u8>> {
             item: BTreeMap::from([("comment".into(), plist::Value::String(String::new()))]),
         })
         .collect();
-    let bytes = music_protocol::catalogue::metadata_edit::encode(
-        &Envelope {
-            database_pid: before.current.catalog.database_pid(),
-            primary_container_pid: before.current.catalog.primary_container_pid(),
-            revision: before.anchor().checked_add(1).context("anchor exhausted")?,
-            timestamp: SystemTime::now(),
-        },
-        &seed,
-    )?;
+    let bytes = music_protocol::catalogue::metadata_edit::encode(envelope, &seed)?;
     let mut value = plist::Value::from_reader(std::io::Cursor::new(bytes))?;
     let operations = value
         .as_dictionary_mut()
@@ -403,23 +411,12 @@ pub(crate) async fn run(o: Request<'_>) -> Result<Report> {
             })
         })
         .collect();
-    for (index, batch) in writes.chunks(500).enumerate() {
+    for (index, batch) in writes.chunks(FAVORITE_BATCH_SIZE).enumerate() {
         let batch_root = root.join(format!("batch-{index}"));
         create_trace(&batch_root)?;
-        // A fresh sealed capture also gives recovery a self-contained Before.
-        let (_, fresh) = removal_batch::capture_fresh(&batch_root.join("before"), &control).await?;
-        ensure!(
-            fresh.current.catalog.source_hashes().database
-                == before.current.catalog.source_hashes().database
-                && fresh.current.catalog.source_hashes().wal
-                    == before.current.catalog.source_hashes().wal
-                && fresh.snapshot.identity.device_identifier_sha256
-                    == before.snapshot.identity.device_identifier_sha256
-                && fresh.snapshot.identity.library_identity_sha256
-                    == before.snapshot.identity.library_identity_sha256,
-            "iPhone changed before favorite batch; sync again"
-        );
-        before = fresh;
+        // Retain the initial/previous verified state for independent recovery.
+        // The native Ready guard still checks these exact bytes before writing.
+        before = removal_batch::retain_before(before, &batch_root.join("before"), &control)?;
         let intent = Intent {
             scope: scope.clone(),
             device: device.clone(),
@@ -795,6 +792,47 @@ mod tests {
             .join()
             .unwrap();
     }
+    #[test]
+    fn favorites_reserve_the_database_operation_and_split_large_selections() {
+        let changes: Vec<_> = (1000..2200)
+            .map(|wire| Change {
+                wire,
+                old: 0,
+                new: 2,
+                result: Baseline {
+                    id: format!("track-{wire}"),
+                    wire,
+                    audio_sha256: "00".repeat(32),
+                    favorite: true,
+                    stamp: Stamp {
+                        dev: 0,
+                        ino: 0,
+                        size: 1,
+                        mtime: (0, 0),
+                        ctime: (0, 0),
+                    },
+                },
+            })
+            .collect();
+        let envelope = music_protocol::catalogue::metadata_edit::Envelope {
+            database_pid: 1,
+            primary_container_pid: 2,
+            revision: 3,
+            timestamp: SystemTime::UNIX_EPOCH,
+        };
+        let mut seen = Vec::new();
+        for batch in changes.chunks(FAVORITE_BATCH_SIZE) {
+            let bytes = encode_changes(&envelope, batch).unwrap();
+            let p = plist::Value::from_reader(std::io::Cursor::new(bytes)).unwrap();
+            let ops = p.as_dictionary().unwrap()["operations"].as_array().unwrap();
+            assert_eq!(ops.len(), batch.len() + 1);
+            assert!(ops.len() <= music_protocol::protocol::operations::MAX_OPERATIONS);
+            seen.extend(batch.iter().map(|c| c.wire));
+        }
+        assert_eq!(seen, changes.iter().map(|c| c.wire).collect::<Vec<_>>());
+        assert!(encode_changes(&envelope, &changes[..500]).is_err());
+    }
+
     #[test]
     fn first_merge_preserves_hearts_and_later_merges_propagate_unfavorites() {
         for local in [false, true] {

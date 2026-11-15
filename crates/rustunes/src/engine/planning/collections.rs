@@ -238,7 +238,7 @@ impl Planner {
         let matching_artists: Vec<_> = self
             .artists
             .iter()
-            .filter(|a| same_name(&a.name, scalar.artist))
+            .filter(|a| same_artist_name(&a.name, scalar.artist))
             .collect();
         ensure!(
             matching_artists.iter().all(|a| a.pid != 0),
@@ -360,6 +360,12 @@ fn mpeg_binding(source: &PreparedSource) -> Result<[u8; 32]> {
         &source.source().fingerprint,
     ))?);
     Ok(h.finalize().into())
+}
+
+// Native album-artist grouping is case/diacritic insensitive. Match only
+// one existing group; the caller refuses ambiguous matches rather than choosing.
+fn same_artist_name(left: &str, right: &str) -> bool {
+    music_protocol::catalogue::insert_verification::native_artist_label(left, right)
 }
 
 /// A documented subset of native IsEqualUText: never split delimiters, apply
@@ -760,6 +766,26 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_artist_alias_reuses_album_and_artist_but_ambiguity_refuses() {
+        let mut p = planner();
+        p.artists[0].name = "Moiré".into();
+        let mut s = source();
+        s.artist = vec!["Moire".into()];
+        let planned = p.plan(&s, candidates(10000)).unwrap();
+        assert_eq!(planned.artist_pid(), 2000);
+        assert_eq!(planned.album_pid(), 3000);
+        assert!(planned.new_collection_ids().is_empty());
+        let mut ambiguous = planner();
+        ambiguous.artists[0].name = "Moiré".into();
+        ambiguous.artists.push(Artist {
+            name: "Moire".into(),
+            pid: 2001,
+            pending: false,
+        });
+        assert!(ambiguous.plan(&s, candidates(10000)).is_err());
     }
 
     #[test]

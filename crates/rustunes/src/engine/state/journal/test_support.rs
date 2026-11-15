@@ -23,7 +23,7 @@ fn operation(pid: u64, anchor: u32) -> Vec<u8> {
     )
 }
 /// The artwork-only update that gives track `pid` the cover `art`.
-fn artwork_operation(pid: u64, anchor: u32, art: &Artwork) -> Vec<u8> {
+fn artwork_operation(pid: u64, anchor: u32, art: &Artwork, format: music_protocol::media::format::Format) -> Vec<u8> {
     envelope(
         anchor,
         vec![
@@ -33,7 +33,7 @@ fn artwork_operation(pid: u64, anchor: u32, art: &Artwork) -> Vec<u8> {
                 "item",
                 dict(vec![
                     ("artwork_cache_id", u64::from(art.cache_id).into()),
-                    ("artwork_checksum", (art.bytes + 17).into()),
+                    ("artwork_checksum", (art.bytes + u64::from(music_protocol::media::artwork::checksum_header(format))).into()),
                 ]),
             ),
         ],
@@ -172,7 +172,7 @@ fn verified(
 ) -> AttemptId {
     let operation = match &content.artwork {
         Some(art) if kind == AttemptKind::Artwork => {
-            artwork_operation(content.track_pid, base, art)
+            artwork_operation(content.track_pid, base, art, content.source.format())
         }
         _ => operation(content.track_pid, base),
     };

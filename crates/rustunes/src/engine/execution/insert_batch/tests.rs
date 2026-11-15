@@ -351,3 +351,221 @@ fn uploads_share_connections_while_their_allowances_fit() {
     );
     assert!(connections(&[]).is_empty());
 }
+
+#[test]
+#[ignore = "explicit FLURB_INSERT_REPLAY directory; reads retained captures and sources only"]
+fn replay_retained_insert_catalogue() {
+    let root =
+        PathBuf::from(std::env::var_os("FLURB_INSERT_REPLAY").expect("explicit retained batch"));
+    let before = snapshot::open(&root.join("snapshot")).unwrap();
+    let observation =
+        std::env::var("FLURB_INSERT_OBSERVE").unwrap_or_else(|_| "observe-001".into());
+    let after = snapshot::open(&root.join(observation).join("snapshot")).unwrap();
+    let input: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("input.json")).unwrap()).unwrap();
+    let members = input["members"].as_array().unwrap();
+    let sources: Vec<_> = members
+        .iter()
+        .map(|m| {
+            Audio::Mpeg(Arc::new(
+                PreparedSource::read_expected(
+                    Path::new(m["source_path"].as_str().unwrap()),
+                    &crate::engine::planning::source_reads::mpeg(Path::new(
+                        m["source_path"].as_str().unwrap(),
+                    ))
+                    .unwrap(),
+                )
+                .unwrap(),
+            ))
+        })
+        .collect();
+    let number = |m: &serde_json::Value, key: &str| {
+        u64::from_str_radix(m[key].as_str().unwrap(), 16).unwrap()
+    };
+    let expected: Vec<_> = members
+        .iter()
+        .zip(&sources)
+        .map(|(m, s)| ExpectedInsert {
+            track_id: number(m, "track"),
+            album_id: number(m, "album"),
+            artist_id: number(m, "artist"),
+            path: m["path"].as_str().unwrap(),
+            file_bytes: m["file_bytes"].as_u64().unwrap(),
+            metadata: s.expected().unwrap(),
+            presented: true,
+        })
+        .collect();
+    for (member, source) in members.iter().zip(&sources) {
+        assert_eq!(
+            hex(&source.transferred().full_file_sha256),
+            member["full_source_sha256"].as_str().unwrap()
+        );
+    }
+    let targets = expected.iter().map(|e| e.track_id).collect();
+    prior_unchanged(&before, &after, &targets, &BTreeSet::new()).unwrap();
+    let covers = members
+        .iter()
+        .filter_map(|m| {
+            m["cover"]["cache_id"]
+                .as_u64()
+                .map(|id| (number(m, "track"), id as u32))
+        })
+        .collect();
+    let checked = insert_verification::verify_insert_batch_after_listening(
+        &before.catalog,
+        &after.catalog,
+        &expected,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &covers,
+        &between_runs::catalogue_listening,
+    )
+    .unwrap();
+    eprintln!(
+        "Verified {} inserted targets, {} prior tracks, {} native artist identity adoptions and {} album identity adoptions",
+        checked.track_ids.len(),
+        checked.prior_tracks_preserved,
+        checked.artist_identity_adoptions.len(),
+        checked.album_identity_adoptions.len()
+    );
+}
+
+#[test]
+#[ignore = "explicit FLURB_PROFILE_INPUT; read-only phone capture and offline batch planning"]
+fn profile_live_batch_preparation_without_sending() {
+    let input = PathBuf::from(std::env::var_os("FLURB_PROFILE_INPUT").expect("input"));
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let temp = Temp::new("plan-profile");
+            let engine = crate::engine::Engine::new(
+                crate::engine::Config {
+                    device: Default::default(),
+                    deadline: None,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+                |_| Ok(()),
+            )
+            .with_source_cache(PathBuf::from(
+                "/Users/joey/.local/state/rustunes/source-cache",
+            ))
+            .with_fingerprint_cache(crate::engine::FingerprintCache::new(
+                PathBuf::from("/Users/joey/.local/state/rustunes/fingerprint-cache"),
+                crate::engine::FingerprintCacheMode::Reuse,
+            ));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(engine.scope(async {
+                let control = control(false);
+                let t = std::time::Instant::now();
+                let (_, before) = removal_batch::capture_fresh(&temp.0.join("before"), &control)
+                    .await
+                    .unwrap();
+                eprintln!("PROFILE capture {:?}", t.elapsed());
+                let data: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
+                let t = std::time::Instant::now();
+                let mut planner = Planner::new(&before.current.catalog, &BTreeSet::new());
+                let mut members = Vec::new();
+                for (index, m) in data["members"].as_array().unwrap().iter().enumerate() {
+                    let path = PathBuf::from(m["source_path"].as_str().unwrap());
+                    let source = PreparedSource::read_expected(
+                        &path,
+                        &crate::engine::planning::source_reads::mpeg(&path).unwrap(),
+                    )
+                    .unwrap();
+                    let base = 0x1234_0000_0000_0000 + index as u64 * 3;
+                    let selected = planner
+                        .plan_mpeg(
+                            &source,
+                            CandidateIds {
+                                track: base,
+                                album: Some(base + 1),
+                                artist: Some(base + 2),
+                            },
+                        )
+                        .unwrap();
+                    members.push(Member {
+                        relative_path: m["source"].as_str().unwrap().into(),
+                        source: path,
+                        audio: Audio::Mpeg(Arc::new(source)),
+                        track: selected.track_pid(),
+                        album: selected.album_pid(),
+                        artist: selected.artist_pid(),
+                        destination: format!("iTunes_Control/Music/F00/T{index:03}.mp3"),
+                        cover: None,
+                        keep_album_image: false,
+                        conversion: None,
+                        convert: false,
+                    });
+                }
+                eprintln!("PROFILE source preparation {:?}", t.elapsed());
+                let t = std::time::Instant::now();
+                let held = hold(&members).unwrap();
+                eprintln!("PROFILE hold {:?}", t.elapsed());
+                let journal =
+                    Journal::create(&temp.0.join("journal"), &before.current.identity).unwrap();
+                let t = std::time::Instant::now();
+                let (op, _) =
+                    plan(&before, &journal, &members, [1; 32], SystemTime::UNIX_EPOCH).unwrap();
+                eprintln!(
+                    "PROFILE plan {:?}, operation bytes {}",
+                    t.elapsed(),
+                    op.len()
+                );
+                drop(held);
+                for member in &mut members {
+                    member.cover=Some(Cover { bytes:vec![1;1024],checksum:1,sha256:sha(&vec![1;1024]) });
+                }
+                let t=std::time::Instant::now();
+                let _=plan(&before,&journal,&members,[1;32],SystemTime::UNIX_EPOCH).unwrap();
+                eprintln!("PROFILE plan with covers {:?}",t.elapsed());
+                let real_path=PathBuf::from("/Users/joey/.local/state/rustunes/devices/6f380ba21134c26538a4444f0be58c0e1fd2a77c4e0ef2eaf5d7e580578145f1/b0356ad1f219b854ccd262c53f4a48edbfc655794e2b3eaf870c2c39fe5b1ee7/journal");
+                let t=std::time::Instant::now();
+                let real=Journal::open_read_only(&real_path,&before.current.identity).unwrap();
+                eprintln!("PROFILE real journal open {:?}",t.elapsed());
+                let t=std::time::Instant::now();
+                let _=plan(&before,&real,&members,[1;32],SystemTime::UNIX_EPOCH).unwrap();
+                eprintln!("PROFILE plan with real journal {:?}",t.elapsed());
+                drop(real);
+                drop(journal);
+                let checks:Vec<_>=before.current.catalog.artwork().album_cache_ids().keys().take(64).enumerate().map(|(i,&album)|
+                    crate::engine::verification::artwork::AlbumOriginalCheck {album,
+                        expected:crate::engine::verification::artwork::OriginalArtworkExpectation { bytes:1024,sha256:[1;32] },
+                        trace:temp.0.join(format!("album-profile-{i:03}")) }).collect();
+                let read_control=Control {deadline:Instant::now()+Duration::from_secs(120),cancelled:Arc::clone(&control.cancelled)};
+                let t=std::time::Instant::now();
+                for (i,check) in checks.iter().take(4).enumerate() {
+                    let _ = crate::engine::verification::artwork::album_original_equal(&before.current,check.album,&check.expected,
+                        &temp.0.join(format!("album-single-{i}")),&read_control,device::provider).await.unwrap();
+                }
+                eprintln!("PROFILE four single album checks {:?}",t.elapsed());
+                let t=std::time::Instant::now();
+                let compared=crate::engine::verification::artwork::album_originals_equal_group(&before.current,&checks,
+                    &temp.0.join("album-group"),&read_control,device::provider).await.unwrap();
+                eprintln!("PROFILE {} grouped album checks {:?}",compared.len(),t.elapsed());
+
+                let t = std::time::Instant::now();
+                let _next =
+                    removal_batch::retain_before(before, &temp.0.join("next"), &control).unwrap();
+                eprintln!("PROFILE retain {:?}", t.elapsed());
+            }));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn maximum_protocol_batch_keeps_all_source_handles_pinned() {
+    let members: Vec<_> = (0..499)
+        .map(|i| member(&format!("large-{i}"), 1, None, false))
+        .collect();
+    let held = hold(&members).unwrap();
+    assert_eq!(held.len(), 499);
+    for source in &held {
+        source.check().unwrap();
+    }
+}

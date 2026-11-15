@@ -466,7 +466,7 @@ pub(crate) async fn run_with(
                 );
             covers.push((
                 checked.sources.base_directory.join(&source.relative_path),
-                source.fingerprint.clone(),
+                source.fingerprint.clone().into(),
                 preserve_album,
                 fresh,
             ));

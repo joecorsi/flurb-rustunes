@@ -52,6 +52,7 @@ pub struct SourceHashes {
     pub wal_bytes: Option<u64>,
 }
 
+#[derive(Clone)]
 pub struct Catalog {
     source_hashes: SourceHashes,
     user_version: i64,
@@ -79,6 +80,46 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub(crate) fn remap_artist_identity(&mut self, old: u64, new: u64) {
+        for artist in self.artists.values_mut() {
+            if artist.sync_id == old {
+                artist.sync_id = new;
+            }
+        }
+        for album in self.albums.values_mut() {
+            if album.artist_sync_id == old {
+                album.artist_sync_id = new;
+            }
+        }
+        for track in &mut self.tracks {
+            if track.artist_sync_id == old {
+                track.artist_sync_id = new;
+            }
+        }
+        self.represented_sync_ids.remove(&old);
+        self.represented_sync_ids.insert(new);
+    }
+
+    pub(crate) fn remap_album_identity(&mut self, old: u64, new: u64) {
+        for album in self.albums.values_mut() {
+            if album.sync_id == old {
+                album.sync_id = new;
+            }
+        }
+        for track in &mut self.tracks {
+            if track.album_sync_id == old {
+                track.album_sync_id = new;
+            }
+        }
+        // Artwork inventory keys are wire album IDs, although the phone's
+        // underlying registration remains attached to the same internal row.
+        if let Some(cache) = self.artwork.album_cache_ids.remove(&old) {
+            self.artwork.album_cache_ids.insert(new, cache);
+        }
+        self.represented_sync_ids.remove(&old);
+        self.represented_sync_ids.insert(new);
+    }
+
     /// The database's `PRAGMA user_version`.
     pub fn user_version(&self) -> i64 {
         self.user_version

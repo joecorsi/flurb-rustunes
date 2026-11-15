@@ -230,6 +230,12 @@ impl Engine {
         self.scope(Box::pin(execution::pull::run(request, self)))
             .await
     }
+    /// Refresh only artwork for changed selected sources with verified audio bindings.
+    pub async fn sync_changed_artwork(&self, result: &SyncResult, files: &[PathBuf], host_name: &str) -> anyhow::Result<usize> {
+        self.scope(execution::cover::changed(&result.run.join("snapshot"), &result.journal,
+            files, &result.run.join("changed-artwork"), host_name, self)).await
+    }
+
     pub async fn cover(&self, request: CoverRequest<'_>) -> Result<CoverResult> {
         self.check()?;
         self.scope(Box::pin(crate::engine::execution::cover::run(
