@@ -1117,6 +1117,20 @@ fn guard_hash(actual: [u8; 32], expected: &ExpectedFile, file: &'static str) -> 
     Ok(())
 }
 
+pub(crate) fn catalog_read_drift(error: &anyhow::Error) -> bool {
+    error.is::<StateReadDrift>()
+}
+
+/// Only a caller that durably cancelled a wholly Unsent batch may use this.
+/// Changed bytes remain an error; this grants a fresh plan, never a bypass.
+pub(crate) fn cancelled_batch_catalog_drift(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<StateReadDrift>() {
+        error.context(crate::engine::execution::apply::PhoneChangedBeforeTransfer)
+    } else {
+        error
+    }
+}
+
 fn stable_attrs(attrs: &Option<Attributes>) -> Option<BTreeMap<&str, &str>> {
     attrs.as_ref().map(|attrs| {
         attrs

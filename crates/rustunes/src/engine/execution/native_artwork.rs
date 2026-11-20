@@ -140,7 +140,10 @@ pub struct ArtworkEvidence {
     pub operation_sha256: [u8; 32],
     pub ready_receipt_sha256: [u8; 32],
     pub terminal_receipt_sha256: [u8; 32],
+    /// Digest inherited from the verified audio binding, not reread for an image-only edit.
     pub permanent_audio_sha256: [u8; 32],
+    /// Stable file identity held across the artwork-only session.
+    pub audio_attributes: Attributes,
     /// Raw JPEG read back from Airlock before FileComplete. This does not verify
     /// a permanent rendered artwork cache file or its pixels.
     pub staged_cover_sha256: [u8; 32],
@@ -180,11 +183,8 @@ where
     );
     let prepared = &attempt.prepared;
     let state = update.state;
-    let source = BoundSource::open_observed(
-        update.source,
-        update.desired_source.file_bytes,
-        update.desired_source.full_file_sha256,
-    )?;
+    // Pin first, then inspect and validate the source once below.
+    let source = BoundSource::open_for_upload(update.source, update.desired_source.file_bytes)?;
     let (current, cover) = super::cover::read_source(update.source)?;
     ensure!(
         current == *update.desired_source,
@@ -249,12 +249,17 @@ where
         )
         .await?;
         let stage = format!("Airlock/Media/Artwork/{asset_id}");
-        preflight(&mut afc, state, &prepared.content, &stage).await?;
+        let audio_before =
+            audio_file_attributes(afc.stat(&prepared.content.path).await?, &prepared.content)?;
         control.check()?;
         let mut session =
             Session::connect(&provider, session_prepared, update.trace, control.deadline).await?;
         // Recheck the exact state in this Ready session, before ANY AFC write.
-        preflight(&mut afc, state, &prepared.content, &stage).await?;
+        let ready_audio = preflight(&mut afc, state, &prepared.content, &stage).await?;
+        ensure!(
+            audio_before == ready_audio,
+            "permanent audio changed while opening artwork session"
+        );
         source.check()?;
         control.check()?;
         let signature = session.sign_metadata(&prepared.operation)?;
@@ -294,7 +299,9 @@ where
         session.wait_finished().await?;
         let terminal = session.terminal_receipt_sha256()?;
         drop(session);
-        let permanent = verify_audio(&mut afc, &prepared.content).await?;
+        let audio_after =
+            audio_file_attributes(afc.stat(&prepared.content.path).await?, &prepared.content)?;
+        let permanent = preserved_audio_digest(&prepared.content, &ready_audio, &audio_after)?;
         source.check()?;
         control.check()?;
         drop(afc);
@@ -306,6 +313,7 @@ where
             ready_receipt_sha256: ready,
             terminal_receipt_sha256: terminal,
             permanent_audio_sha256: permanent,
+            audio_attributes: audio_after,
             // The write's replies and the stored size confirmed these bytes.
             staged_cover_sha256: uploaded,
             media_anchor: state
@@ -337,10 +345,16 @@ where
 
 // Tag/artwork edits can move the audio payload and change trailing tags.
 // Validated codec-tagged digests identify the frames, independently of layout.
-pub(crate) fn same_encoded_audio(desired: &TransferredSource, transferred: &TransferredSource) -> Result<bool> {
+pub(crate) fn same_encoded_audio(
+    desired: &TransferredSource,
+    transferred: &TransferredSource,
+) -> Result<bool> {
     desired.validate()?;
     transferred.validate()?;
-    Ok(desired.format() == transferred.format() && desired.audio.sha256 == transferred.audio.sha256)
+    Ok(
+        desired.format() == transferred.format()
+            && desired.audio.sha256 == transferred.audio.sha256,
+    )
 }
 
 fn validate_preparation(
@@ -458,8 +472,7 @@ fn operation_budget(state_chunks: u64, artwork_db: u64, audio: u64, cover: u64) 
         "artwork operation inputs exceed bounds"
     );
     let operations = state_chunks
-        .checked_mul(2)
-        .and_then(|n| n.checked_add(artwork_db.div_ceil(CHUNK) * 2))
+        .checked_add(artwork_db.div_ceil(CHUNK))
         .and_then(|n| n.checked_add(cover.div_ceil(CHUNK) * 2))
         .and_then(|n| n.checked_add(512))
         .context("artwork operation budget overflow")?;
@@ -468,10 +481,7 @@ fn operation_budget(state_chunks: u64, artwork_db: u64, audio: u64, cover: u64) 
         operations <= MAX_BOUNDED_OPS,
         "derived artwork AFC allowance exceeds bound"
     );
-    let operations = (operations as u64)
-        .checked_add(audio.div_ceil(CHUNK) * 3)
-        .context("audio readback allowance overflow")?;
-    Ok(usize::try_from(operations)?)
+    Ok(operations)
 }
 
 async fn preflight(
@@ -479,9 +489,11 @@ async fn preflight(
     state: &FreshArtworkState<'_>,
     content: &Content,
     stage: &str,
-) -> Result<()> {
-    // Bracket the whole combined guard, not only each hash, so a state change
-    // during the permanent audio readback cannot escape the pre-write check.
+) -> Result<Attributes> {
+    // One full state guard in Ready, immediately before the durable send gate.
+    // The operation is rebuilt as artwork-only; audio is never opened for
+    // writing. Pin its attributes here and compare them after SyncFinished.
+    // Its already-verified digest stays in the binding without USB audio reads.
     const NAMES: [&str; 7] = [
         "iTunes_Control/iTunes/iTunesPrefs",
         "iTunes_Control/iTunes/iTunesPrefs.plist",
@@ -491,6 +503,7 @@ async fn preflight(
         "iTunes_Control/iTunes/iTunesCDB",
         ARTWORK_DB,
     ];
+    let audio_before = audio_file_attributes(afc.stat(&content.path).await?, content)?;
     let mut before = Vec::new();
     for name in NAMES {
         before.push(afc.stat(name).await?);
@@ -506,7 +519,7 @@ async fn preflight(
             == state.artwork_sha256,
         "saved ArtworkDB changed since allocation"
     );
-    verify_audio(afc, content).await?;
+
     afc.require_directory("iTunes_Control/Sync/Media").await?;
     afc.require_directory_or_absent(crate::engine::execution::native_insert::STAGING_ARTWORK)
         .await?;
@@ -520,13 +533,18 @@ async fn preflight(
     for path in [METADATA, SIGNATURE, stage] {
         afc.require_absent(path).await?;
     }
+    let audio_after = audio_file_attributes(afc.stat(&content.path).await?, content)?;
+    ensure!(
+        audio_before == audio_after,
+        "permanent audio attributes changed during artwork preflight"
+    );
     for (name, previous) in NAMES.into_iter().zip(before) {
         ensure!(
             stable_attrs(previous) == stable_attrs(afc.stat(name).await?),
             "artwork preflight state changed across combined readback"
         );
     }
-    Ok(())
+    Ok(audio_after)
 }
 
 fn stable_attrs(attrs: Option<Attributes>) -> Option<Attributes> {
@@ -535,15 +553,34 @@ fn stable_attrs(attrs: Option<Attributes>) -> Option<Attributes> {
         attrs
     })
 }
-async fn verify_audio(afc: &mut Transfer, content: &Content) -> Result<[u8; 32]> {
-    let hash = afc
-        .read_hash(&content.path, content.source.file_bytes, MAX_AUDIO)
-        .await?;
+fn audio_file_attributes(attributes: Option<Attributes>, content: &Content) -> Result<Attributes> {
+    let attributes = attributes.context("permanent audio is missing before artwork update")?;
+    regular_size(&attributes, content.source.file_bytes)?;
+    attributes
+        .get("st_mtime")
+        .context("permanent audio modification time is missing")?
+        .parse::<u64>()
+        .context("invalid audio modification time")?;
+    Ok(stable_attrs(Some(attributes)).expect("present attributes"))
+}
+
+/// An artwork operation has no audio mutation or rename. Reuse the already
+/// verified container identity only when its complete stable stat is unchanged.
+/// A missing file, new inode, changed length or write time refuses completion.
+fn preserved_audio_digest(
+    content: &Content,
+    before: &Attributes,
+    after: &Attributes,
+) -> Result<[u8; 32]> {
     ensure!(
-        hash == content.source.full_file_sha256,
-        "permanent audio differs from transferred container"
+        before == after,
+        "permanent audio changed during artwork update"
     );
-    Ok(hash)
+    ensure!(
+        content.source.full_file_sha256 != [0; 32],
+        "verified audio digest is absent"
+    );
+    Ok(content.source.full_file_sha256)
 }
 fn binary(dictionary: Dictionary) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -595,6 +632,10 @@ fn input_receipt(
         (prepared.content.track_pid as i64).into(),
     );
     d.insert("CacheID".into(), art.cache_id.into());
+    d.insert(
+        "AudioVerification".into(),
+        "PreviouslyVerifiedContainerWithUnchangedAttributes".into(),
+    );
     d.insert("CoverBytes".into(), art.bytes.into());
     d.insert("CoverSHA256".into(), hex(&art.sha256).into());
     d.insert("ForeignArtworkProvider".into(), "Unavailable".into());
@@ -619,6 +660,19 @@ fn evidence_plist(e: &ArtworkEvidence) -> Result<Vec<u8>> {
         e.content.source.file_bytes.into(),
     );
     d.insert("DesiredSourceBytes".into(), e.desired_source_bytes.into());
+    d.insert(
+        "AudioVerification".into(),
+        "PreviouslyVerifiedContainerWithUnchangedAttributes".into(),
+    );
+    d.insert(
+        "AudioAttributes".into(),
+        Value::Dictionary(
+            e.audio_attributes
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect(),
+        ),
+    );
     d.insert("CoverBytes".into(), art.bytes.into());
     d.insert("CacheID".into(), art.cache_id.into());
     d.insert("MediaAnchor".into(), e.media_anchor.into());

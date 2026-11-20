@@ -406,9 +406,76 @@ fn write_baseline(tx: &rusqlite::Transaction<'_>, b: &Baseline) -> Result<()> {
     Ok(())
 }
 
+impl Store {
+    pub(super) fn cloud_export(&self) -> Result<String> {
+        ensure!(
+            self.pending()?.is_empty(),
+            "A playlist write is unfinished; recover it before moving to another computer"
+        );
+        let mut q = self
+            .db
+            .prepare("SELECT body FROM bindings ORDER BY device,library,local_id")?;
+        let bodies = q
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let values = bodies
+            .into_iter()
+            .map(|b| decode::<Baseline>(&b))
+            .collect::<Result<Vec<_>>>()?;
+        for value in &values {
+            validate(value)?;
+        }
+        Ok(serde_json::to_string(&values)?)
+    }
+    pub(super) fn cloud_import(&mut self, body: &str, root: &Path) -> Result<()> {
+        ensure!(
+            body.len() <= 128 * 1024 * 1024,
+            "cloud playlist baselines exceed bound"
+        );
+        let mut values: Vec<Baseline> = serde_json::from_str(body)?;
+        ensure!(
+            values.len() <= 50_000 && self.pending()?.is_empty(),
+            "Unfinished local playlist work must be recovered first"
+        );
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for value in &mut values {
+            for member in &mut value.members {
+                if let Some(relative) = member.source.strip_prefix("flurb-music:") {
+                    let p = Path::new(relative);
+                    ensure!(
+                        !p.is_absolute()
+                            && p.components()
+                                .all(|c| matches!(c, std::path::Component::Normal(_))),
+                        "unsafe cloud playlist source"
+                    );
+                    member.source = root.join(p).to_string_lossy().into();
+                } else {
+                    member.source.clear();
+                }
+            }
+            validate(value)?;
+            // Cloud ownership serializes device writes. These remain baselines,
+            // never write permissions; reconciliation checks the live phone.
+            write_baseline(&tx, value)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cloud_baselines_preserve_phone_ids_and_remap_music_roots(){
+        let target=Temp::new();let mut store=Store::open(&target.0).unwrap();let mut value=baseline();value.members[0].source="flurb-music:Artist/A.mp3".into();
+        store.cloud_import(&serde_json::to_string(&vec![value.clone()]).unwrap(),Path::new("/other/music")).unwrap();
+        let restored=store.get(&value.device,&value.library,&value.local_id).unwrap().unwrap();assert_eq!(restored.phone_id,value.phone_id);assert_eq!(restored.members[0].source,"/other/music/Artist/A.mp3");assert_eq!(restored.members[0].phone_id,value.members[0].phone_id);
+        store.db.execute("INSERT INTO pending VALUES(?1,?2,'x','prepared','{}')",params![value.device,value.library]).unwrap();assert!(store.cloud_export().is_err());assert!(store.cloud_import("[]",Path::new("/music")).is_err());
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {

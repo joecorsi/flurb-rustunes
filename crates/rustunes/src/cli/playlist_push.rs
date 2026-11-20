@@ -30,7 +30,7 @@ use crate::engine::{
     },
 };
 
-pub(super) mod managed;
+pub(crate) mod managed;
 
 pub(super) struct Options<'a> {
     pub(super) playlist: &'a Path,

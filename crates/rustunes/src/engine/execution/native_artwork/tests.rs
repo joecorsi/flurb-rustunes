@@ -400,7 +400,7 @@ fn cdb_binding_and_deadline_budget_are_strict() {
             < 1024
     );
     assert!(operation_budget(u64::MAX, 0, 0, 0).is_err());
-    assert!(operation_budget(4000, MAX_ASSET, MAX_AUDIO, MAX_ASSET).is_err());
+    assert!(operation_budget(8000, MAX_ASSET, MAX_AUDIO, MAX_ASSET).is_err());
     assert!(operation_budget(1, MAX_ASSET + 1, 1, 1).is_err());
 }
 
@@ -416,6 +416,7 @@ fn evidence_distinguishes_desired_source_from_permanent_audio() {
     let desired = fingerprint::read(&desired).unwrap();
     let evidence = ArtworkEvidence {
         permanent_audio_sha256: content.source.full_file_sha256,
+        audio_attributes: Attributes::new(),
         staged_cover_sha256: content.artwork.as_ref().unwrap().sha256,
         content,
         desired_source_sha256: desired.full_file_sha256,
@@ -513,4 +514,62 @@ async fn interrupted_started_and_cancelled_deadline_never_open_connector() {
         AttemptState::ReconciliationRequired
     );
     assert!(!trace.exists());
+}
+
+#[test]
+fn artwork_preflight_guards_audio_attributes_without_streaming_its_payload() {
+    let content = crate::engine::state::journal::test_support::alac_content(1);
+    let attributes = Attributes::from([
+        ("st_ifmt".into(), "S_IFREG".into()),
+        ("st_size".into(), content.source.file_bytes.to_string()),
+        ("st_mtime".into(), "1234".into()),
+        ("st_atime".into(), "1".into()),
+    ]);
+    let mut read_later = attributes.clone();
+    read_later.insert("st_atime".into(), "2".into());
+    assert_eq!(
+        audio_file_attributes(Some(attributes.clone()), &content).unwrap(),
+        audio_file_attributes(Some(read_later), &content).unwrap()
+    );
+    let mut changed = attributes.clone();
+    changed.insert("st_size".into(), "0".into());
+    assert!(audio_file_attributes(Some(changed), &content).is_err());
+    let mut missing_time = attributes.clone();
+    missing_time.remove("st_mtime");
+    assert!(audio_file_attributes(Some(missing_time), &content).is_err());
+    let mut directory = attributes;
+    directory.insert("st_ifmt".into(), "S_IFDIR".into());
+    assert!(audio_file_attributes(Some(directory), &content).is_err());
+    assert!(audio_file_attributes(None, &content).is_err());
+}
+#[test]
+fn artwork_budget_is_independent_of_audio_length() {
+    let base = operation_budget(0, 0, 0, 0).unwrap();
+    let bytes = CHUNK * 20;
+    assert_eq!(operation_budget(0, 0, bytes, 0).unwrap(), base);
+    assert_eq!(operation_budget(0, 0, MAX_AUDIO, 0).unwrap(), base);
+}
+
+#[test]
+fn artwork_preserves_verified_audio_identity_only_with_unchanged_file_attributes() {
+    let content = crate::engine::state::journal::test_support::alac_content(1);
+    let before = Attributes::from([
+        ("st_ifmt".into(), "S_IFREG".into()),
+        ("st_size".into(), content.source.file_bytes.to_string()),
+        ("st_mtime".into(), "1234".into()),
+        ("st_ino".into(), "42".into()),
+    ]);
+    let before = audio_file_attributes(Some(before), &content).unwrap();
+    assert_eq!(
+        preserved_audio_digest(&content, &before, &before).unwrap(),
+        content.source.full_file_sha256
+    );
+    for key in ["st_mtime", "st_ino", "st_size"] {
+        let mut after = before.clone();
+        after.insert(key.into(), "9999".into());
+        assert!(
+            preserved_audio_digest(&content, &before, &after).is_err(),
+            "{key}"
+        );
+    }
 }

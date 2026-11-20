@@ -193,6 +193,7 @@ pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
         Event::Uploading { .. }
         | Event::TracksPulled { .. }
         | Event::InsertBatchStarted { .. }
+        | Event::InsertBatchSending
         | Event::RemovalBatchStarted { .. } => return Ok(None),
         // Results print on stdout, and the other renderers own their lines.
         Event::Deletion(_)
