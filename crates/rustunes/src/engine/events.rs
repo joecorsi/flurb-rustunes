@@ -71,6 +71,8 @@ pub enum Event<'a> {
         bytes: u64,
         removals: usize,
     },
+    /// The batch is durably Started and is about to stage metadata on the phone.
+    InsertBatchSending,
     /// `sent` of a new track's `file_bytes` bytes of audio are on the phone.
     /// `source` names its file, relative to the source root, where known.
     Uploading {

@@ -133,8 +133,12 @@ fn validate_cover(cover: &Cover) -> Result<()> {
     );
     ensure!(
         <[u8; 32]>::from(Sha256::digest(&cover.bytes)) == cover.sha256
-            && [1, music_protocol::media::artwork::MP4_CHECKSUM_HEADER].into_iter().any(|header|
-                u32::try_from(cover.bytes.len()).ok().and_then(|bytes| bytes.checked_add(header)) == Some(cover.checksum)),
+            && [1, music_protocol::media::artwork::MP4_CHECKSUM_HEADER]
+                .into_iter()
+                .any(|header| u32::try_from(cover.bytes.len())
+                    .ok()
+                    .and_then(|bytes| bytes.checked_add(header))
+                    == Some(cover.checksum)),
         "source cover digest or checksum mismatch"
     );
     Ok(())
@@ -274,10 +278,69 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DeviceProvider>>,
 {
+    verify_track_expected_inner(current, target, expected, trace, control, connect, true).await
+}
+
+/// A just-captured After already supplies the opening catalogue proof.
+/// Keep the exact same permanent JPEG/derivative checks and closing full-state
+/// guard, without downloading the entire library a second time before them.
+pub(crate) async fn verify_track_after_update<F, Fut>(
+    current: &Current,
+    target: u64,
+    cache: u32,
+    cover: &Cover,
+    trace: &Path,
+    control: &Control,
+    connect: F,
+) -> Result<VerifiedTrackArtworkBytes>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    validate_cover(cover)?;
+    verify_track_expected_inner(
+        current,
+        target,
+        &TrackArtworkExpectation {
+            cache_id: cache,
+            bytes: cover.bytes.len() as u64,
+            sha256: cover.sha256,
+        },
+        trace,
+        control,
+        connect,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_track_expected_inner<F, Fut>(
+    current: &Current,
+    target: u64,
+    expected: &TrackArtworkExpectation,
+    trace: &Path,
+    control: &Control,
+    connect: F,
+    opening_guard: bool,
+) -> Result<VerifiedTrackArtworkBytes>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
     control.check()?;
     let selected = track_plan(&current.catalog, target, expected)?;
     let state = current_state(current, control, &BTreeSet::new())?;
-    let mut afc = connect_guarded(current, &state, trace, control, 2, connect).await?;
+    let mut afc = connect_readback(
+        current,
+        &state,
+        trace,
+        control,
+        2 * MAX_IMAGE_BYTES.div_ceil(65536),
+        connect,
+        opening_guard,
+    )
+    .await?;
     let proof = read_track(
         &mut afc, current, target, expected, &selected, trace, control,
     )
@@ -1709,10 +1772,27 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DeviceProvider>>,
 {
+    connect_readback(current, state, trace, control, image_ops, connect, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_readback<F, Fut>(
+    current: &Current,
+    state: &FreshState,
+    trace: &Path,
+    control: &Control,
+    image_ops: u64,
+    connect: F,
+    opening_guard: bool,
+) -> Result<Transfer>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
     let operations = usize::try_from(
         state
             .state_read_chunks()?
-            .checked_mul(2)
+            .checked_mul(if opening_guard { 2 } else { 1 })
             .and_then(|n| n.checked_add(image_ops))
             .and_then(|n| n.checked_add(GUARD_EXTRA_OPS))
             .context("artwork operation budget overflow")?,
@@ -1742,7 +1822,9 @@ where
         Arc::clone(&control.cancelled),
     )
     .await?;
-    state.verify_state(&mut afc).await?;
+    if opening_guard {
+        state.verify_state(&mut afc).await?;
+    }
     Ok(afc)
 }
 

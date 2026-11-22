@@ -2160,3 +2160,21 @@ These were decided and tested, not discovered:
 ### 12.3 Planned and open
 
 Nothing is PLANNED. OPEN: the questions in section 11.
+
+### Artwork-only update I/O
+
+An artwork-only update never retransfers or rehashes the permanent audio over
+USB. Its audio identity comes from the already verified journal binding. The
+path, regular-file type, size and stable AFC attributes are held across the
+Ready gate and SyncFinished; any change refuses completion. This is an
+attribute-preservation check, not a new byte-for-byte audio verification.
+Recovery of interrupted or uncertain operations retains its stronger checks.
+
+The normal path performs one complete state guard in Ready before the signed
+artwork operation is staged. After SyncFinished it captures the catalogue once,
+checks the expected SQL changes, reads the exact permanent JPEG and decodes the
+rendered image, then closes with a full catalogue-state guard. The fresh After
+capture replaces a redundant opening guard around that image readback. A
+verified After can serve as the next update's Before; the next Ready guard
+still rejects stale state before any write. Each completion receipt records
+phase timings and identifies the inherited audio digest explicitly.

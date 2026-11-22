@@ -1002,3 +1002,25 @@ mod request_tests {
 
 #[cfg(test)]
 mod sql_tests;
+
+pub(crate) fn export_cloud_baselines(state: &Path, root: &Path) -> Result<String> {
+    let body = Store::open(state)?.cloud_export()?;
+    let mut values: Vec<Baseline> = serde_json::from_str(&body)?;
+    let canonical = fs::canonicalize(root).unwrap_or(root.to_owned());
+    for value in &mut values {
+        for member in &mut value.members {
+            let path = PathBuf::from(&member.source);
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            member.source = path
+                .strip_prefix(&canonical)
+                .ok()
+                .and_then(|p| p.to_str())
+                .map(|p| format!("flurb-music:{p}"))
+                .unwrap_or_default();
+        }
+    }
+    Ok(serde_json::to_string(&values)?)
+}
+pub(crate) fn import_cloud_baselines(state: &Path, root: &Path, body: &str) -> Result<()> {
+    Store::open(state)?.cloud_import(body, root)
+}

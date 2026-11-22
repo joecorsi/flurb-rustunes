@@ -379,6 +379,12 @@ async fn run_once(
         &before.snapshot.identity.device_identifier_sha256,
         &before.snapshot.identity.library_identity_sha256,
     )?;
+    if journal_path.join("cloud-import").try_exists()? {
+        drop(store);drop(before);
+        engine.pull(crate::engine::PullRequest{state:o.state,library:None,recursive:false,dry_run:false,seconds:o.seconds,tracks_into:None}).await.context("confirming a cloud-restored device snapshot against the connected iPhone")?;
+        ensure!(!journal_path.join("cloud-import").try_exists()?,"cloud-restored journal was not refreshed; no transfer started");
+        return Box::pin(run_once(o,engine,recovered)).await;
+    }
     let pending = if journal_path.join("journal.sqlite").try_exists()? {
         let journal = Journal::open_read_only(&journal_path, &identity)?;
         journal.outstanding_insert_batch()?.is_some()

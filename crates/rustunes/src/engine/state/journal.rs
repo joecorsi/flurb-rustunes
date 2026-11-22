@@ -7,6 +7,9 @@
 //! after interruption it requires fresh external reconciliation. SQLite EXTRA
 //! synchronization plus directory fsync precedes every returned write permit.
 
+mod cloud;
+pub use cloud::{export_cloud_snapshot, import_cloud_snapshot};
+
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -1613,7 +1616,11 @@ fn validate_prepared(prepared: &PreparedAttempt) -> Result<()> {
                     && item
                         .get("artwork_checksum")
                         .and_then(Value::as_unsigned_integer)
-                        == art.bytes.checked_add(u64::from(music_protocol::media::artwork::checksum_header(prepared.content.source.format()))),
+                        == art.bytes.checked_add(u64::from(
+                            music_protocol::media::artwork::checksum_header(
+                                prepared.content.source.format()
+                            )
+                        )),
                 "unsupported artwork-only operation"
             );
         }

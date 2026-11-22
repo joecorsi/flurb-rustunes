@@ -643,7 +643,7 @@ pub(crate) async fn run(
                 format!("{error:#}\nNothing was written to the phone; the batch was cancelled.\n")
                     .as_bytes(),
             );
-            return Err(error);
+            return Err(crate::engine::execution::native_insert::cancelled_batch_catalog_drift(error));
         }
         Sent::Started(wire) => wire.and_then(|wire| {
             durable_write(
@@ -959,6 +959,7 @@ pub(crate) async fn send_session<T: session::StartedOperation>(
         )));
     };
     let wire = controlled(control, async {
+        crate::engine::observe(crate::engine::Event::InsertBatchSending)?;
         session.stage_metadata(&mut afc, &started).await?;
         control.check()?;
         session.finish_metadata().await?;

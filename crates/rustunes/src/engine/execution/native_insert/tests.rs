@@ -718,3 +718,12 @@ fn two_read_only_drifts_exhaust_without_rows_inputs_or_reservations() {
     assert_eq!(fs::read(dir.join("journal.sqlite")).unwrap(), original);
     assert!(!temp.0.join("input.json").exists());
 }
+
+#[test]
+fn cancelled_unsent_batch_catalog_drift_requests_a_fresh_plan_only(){
+    let error=cancelled_batch_catalog_drift(StateReadDrift{file:"MediaLibrary.sqlitedb-wal",reason:"regular file size changed"}.into());
+    assert!(error.is::<crate::engine::PhoneChangedBeforeTransfer>());
+    assert!(format!("{error:#}").contains("regular file size changed"));
+    let refusal=cancelled_batch_catalog_drift(anyhow::anyhow!("source file changed"));
+    assert!(!refusal.is::<crate::engine::PhoneChangedBeforeTransfer>());
+}

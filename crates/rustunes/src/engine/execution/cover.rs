@@ -28,6 +28,7 @@ use music_protocol::media::artwork;
 use music_protocol::media::fingerprint;
 use music_protocol::protocol::trace::private_write;
 
+#[derive(Clone, Copy)]
 pub struct Options<'a> {
     pub file: &'a Path,
     pub snapshot: &'a Path,
@@ -45,7 +46,26 @@ pub struct Options<'a> {
 }
 
 pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverResult> {
+    run_with_verified_current(options, engine, None)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Constructed only after SQL and permanent-image verification.
+/// Audio identity is inherited from the prior verified binding, with its
+/// stable file attributes held across the artwork-only session.
+/// The next operation still rechecks all captured state before any write.
+struct VerifiedCurrent {
+    current: current::Current,
+    directory: std::path::PathBuf,
+}
+async fn run_with_verified_current(
+    options: Options<'_>,
+    engine: &Engine,
+    prior: Option<VerifiedCurrent>,
+) -> Result<(CoverResult, Option<VerifiedCurrent>)> {
     engine.check()?;
+    let started = std::time::Instant::now();
     ensure!(
         !options.trace.try_exists()?,
         "artwork trace directory must be new"
@@ -55,7 +75,8 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
     let identity = Identity::for_saved_device(saved.identity.device_identifier_sha256, &library)?;
     let mut journal = Journal::open(options.journal, &identity)?;
     if let Some(attempt) = journal.outstanding()? {
-        if attempt.state == AttemptState::Prepared && attempt.prepared.kind == AttemptKind::Artwork {
+        if attempt.state == AttemptState::Prepared && attempt.prepared.kind == AttemptKind::Artwork
+        {
             journal.cancel_prepared(attempt.id)?;
         }
     }
@@ -84,14 +105,26 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
             .unwrap_or(Path::new(".")),
     )?
     .sync_all()?;
-    let capture_control = engine.control(120);
-    let current = current::capture_with_artwork_controlled(
-        &options.trace.join("before"),
-        &identity,
-        capture_control.deadline,
-        Arc::clone(&capture_control.cancelled),
-    )
-    .await?;
+    let before_started = std::time::Instant::now();
+    let current = if let Some(prior) = prior {
+        ensure!(
+            prior.current.identity.device_digest() == identity.device_digest()
+                && prior.current.identity.library_digest() == identity.library_digest(),
+            "verified artwork capture belongs to another device or library"
+        );
+        super::removal_batch::copy_snapshot(&prior.directory, &options.trace.join("before"))?;
+        prior.current
+    } else {
+        let capture_control = engine.control(120);
+        current::capture_with_artwork_controlled(
+            &options.trace.join("before"),
+            &identity,
+            capture_control.deadline,
+            Arc::clone(&capture_control.cancelled),
+        )
+        .await?
+    };
+    let before_ms = before_started.elapsed().as_millis();
     let artwork_db = current
         .artwork_db
         .as_deref()
@@ -147,7 +180,13 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         )?;
         File::open(options.trace)?.sync_all()?;
         engine.emit(Event::CoverFinished(CoverResult::Unchanged))?;
-        return Ok(CoverResult::Unchanged);
+        return Ok((
+            CoverResult::Unchanged,
+            Some(VerifiedCurrent {
+                current,
+                directory: options.trace.join("before"),
+            }),
+        ));
     }
     let preserved_album = if let Some(album) = options.preserve_album {
         ensure!(
@@ -208,7 +247,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
             bytes: cover.bytes.len(),
         };
         engine.emit(Event::CoverFinished(result))?;
-        return Ok(result);
+        return Ok((result, None));
     }
     let input_hash = Sha256::digest(&bytes).into();
     let state = FreshArtworkState::new(
@@ -237,9 +276,22 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         input_receipt_sha256: input_hash,
     })?;
     engine.emit(Event::ArtworkStarted { track_id })?;
-    let pending = match native_artwork::execute(&mut journal, ArtworkUpdate { attempt, source: options.file,
-        desired_source: &desired, state: &state, host_name: options.host_name,
-        trace: &options.trace.join("transfer") }, &engine.control(180), device::provider).await {
+    let session_started = std::time::Instant::now();
+    let pending = match native_artwork::execute(
+        &mut journal,
+        ArtworkUpdate {
+            attempt,
+            source: options.file,
+            desired_source: &desired,
+            state: &state,
+            host_name: options.host_name,
+            trace: &options.trace.join("transfer"),
+        },
+        &engine.control(180),
+        device::provider,
+    )
+    .await
+    {
         Ok(pending) => pending,
         Err(error) => {
             // Prepared means the durable send gate was never crossed. Started
@@ -250,6 +302,8 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
             return Err(error).context("artwork update did not reach independent verification");
         }
     };
+    let session_ms = session_started.elapsed().as_millis();
+    let after_started = std::time::Instant::now();
     let after_control = engine.control(120);
     let after = current::capture_with_artwork_controlled(
         &options.trace.join("after"),
@@ -258,13 +312,15 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         Arc::clone(&after_control.cancelled),
     )
     .await?;
+    let after_ms = after_started.elapsed().as_millis();
+    let artwork_started = std::time::Instant::now();
     let catalog_proof = artwork_verification::verify_independent_representative(
         &current.catalog,
         &after.catalog,
         track_id,
         cache,
     )?;
-    let file_proof = crate::engine::verification::artwork::verify_track(
+    let file_proof = crate::engine::verification::artwork::verify_track_after_update(
         &after,
         track_id,
         cache,
@@ -292,7 +348,11 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
     let receipt = serde_json::json!({"schema":"rustunes.verified-artwork","catalogue":catalog_proof,"permanent_files":file_proof,
         "preserved_album_original_after":protected_album_after,
         "transfer_receipt_sha256":hex(&pending.evidence.receipt_sha256),"after_state_receipt_sha256":hex(&after.receipt_sha256),
-        "preserved_audio_sha256":hex(&pending.evidence.permanent_audio_sha256),"staged_jpeg_sha256":hex(&pending.evidence.staged_cover_sha256),
+        "preserved_audio_sha256":hex(&pending.evidence.permanent_audio_sha256),
+        "audio_verification":"previously_verified_container_with_unchanged_attributes",
+        "audio_attributes":pending.evidence.audio_attributes,"staged_jpeg_sha256":hex(&pending.evidence.staged_cover_sha256),
+        "timing_ms":{"before_capture":before_ms,"native_session":session_ms,"after_capture":after_ms,
+            "artwork_readback":artwork_started.elapsed().as_millis(),"total":started.elapsed().as_millis()},
         "phone_deletions":0});
     let bytes = serde_json::to_vec_pretty(&receipt)?;
     private_write(&options.trace.join("verified.json"), &bytes)?;
@@ -310,7 +370,13 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         },
     )?;
     engine.emit(Event::CoverFinished(CoverResult::Verified))?;
-    Ok(CoverResult::Verified)
+    Ok((
+        CoverResult::Verified,
+        Some(VerifiedCurrent {
+            current: after,
+            directory: options.trace.join("after"),
+        }),
+    ))
 }
 
 /// Fail before any transfer when the required image decoder is unavailable.
@@ -369,6 +435,7 @@ pub(crate) async fn changed(
     let identity = Identity::for_saved_device(saved.identity.device_identifier_sha256, &library)?;
     let mut changed = 0;
     let mut seen = std::collections::BTreeSet::new();
+    let mut previous = None;
     for file in files {
         engine.check()?;
         let (desired, cover) = read_source(file)?;
@@ -388,27 +455,50 @@ pub(crate) async fn changed(
             number: changed + 1,
             total: files.len(),
         })?;
-        run(
-            Options {
-                file,
-                snapshot: snapshot_path,
-                journal: journal_path,
-                trace: &trace.join(format!("cover-{:04}", changed + 1)),
-                host_name,
-                dry_run: false,
-                expected_source: Some(&desired),
-                preserve_album: None,
-                pending_cover_only: false,
-            },
-            engine,
-        )
-        .await
+        let directory = trace.join(format!("cover-{:04}", changed + 1));
+        let options = Options {
+            file,
+            snapshot: snapshot_path,
+            journal: journal_path,
+            trace: &directory,
+            host_name,
+            dry_run: false,
+            expected_source: Some(&desired),
+            preserve_album: None,
+            pending_cover_only: false,
+        };
+        let reused = previous.is_some();
+        let outcome = run_with_verified_current(options, engine, previous.take()).await;
+        let refreshed = trace.join(format!("cover-{:04}-refresh", changed + 1));
+        let (_, next) = match outcome {
+            Err(error)
+                if reused
+                    && super::native_insert::catalog_read_drift(&error)
+                    && Journal::open_read_only(journal_path, &identity)?
+                        .outstanding()?
+                        .is_none() =>
+            {
+                // The unsent Prepared attempt was durably cancelled. A changed
+                // phone gets one genuinely fresh capture, never a guard bypass.
+                run_with_verified_current(
+                    Options {
+                        trace: &refreshed,
+                        ..options
+                    },
+                    engine,
+                    None,
+                )
+                .await
+            }
+            result => result,
+        }
         .with_context(|| {
             format!(
                 "updating artwork for {}",
                 file.file_name().unwrap_or_default().to_string_lossy()
             )
         })?;
+        previous = next;
         changed += 1;
     }
     Ok(changed)
@@ -496,16 +586,24 @@ mod changed_tests {
         mp3(&first, &jpeg("color=c=red:s=8x8"));
         mp3(&second, &jpeg("color=c=blue:s=8x8"));
         let mut bytes = fs::read(&second).unwrap();
-        let size = bytes[6..10].iter().fold(0usize, |n, &b| (n << 7) | usize::from(b));
+        let size = bytes[6..10]
+            .iter()
+            .fold(0usize, |n, &b| (n << 7) | usize::from(b));
         bytes.splice(10 + size..10 + size, [0u8; 512]);
         let size = size + 512;
-        bytes[6..10].copy_from_slice(&[((size >> 21) & 127) as u8, ((size >> 14) & 127) as u8, ((size >> 7) & 127) as u8, (size & 127) as u8]);
+        bytes[6..10].copy_from_slice(&[
+            ((size >> 21) & 127) as u8,
+            ((size >> 14) & 127) as u8,
+            ((size >> 7) & 127) as u8,
+            (size & 127) as u8,
+        ]);
         fs::write(&second, bytes).unwrap();
         let (old, original) = read_source(&first).unwrap();
         let (desired, replacement) = read_source(&second).unwrap();
         assert!(old.audio != desired.audio); // includes the shifted ID3/audio offset
         assert!(native_artwork::same_encoded_audio(&desired, &old).unwrap());
-        let mut different = desired.clone(); different.audio.sha256[0] ^= 1;
+        let mut different = desired.clone();
+        different.audio.sha256[0] ^= 1;
         assert!(native_artwork::same_encoded_audio(&different, &old).is_err());
         assert_ne!(old.full_file_sha256, desired.full_file_sha256);
         let original = original.unwrap();
@@ -513,8 +611,15 @@ mod changed_tests {
         let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
         // Exercise the real builder too: an MP3 must not be subjected to the
         // old ALAC-only checksum check after its cover has been read correctly.
-        artwork_update::prepare_for_format(&catalog, catalog.tracks()[0].sync_id, 100,
-            &replacement, SystemTime::UNIX_EPOCH, desired.format()).unwrap();
+        artwork_update::prepare_for_format(
+            &catalog,
+            catalog.tracks()[0].sync_id,
+            100,
+            &replacement,
+            SystemTime::UNIX_EPOCH,
+            desired.format(),
+        )
+        .unwrap();
         let mut content = Content {
             source: old.clone(),
             track_pid: 1001,

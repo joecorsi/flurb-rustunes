@@ -307,7 +307,7 @@ async fn capture(
 
 /// Copy a complete snapshot directory into a new private one, files keeping
 /// their modes, everything synchronized.
-fn copy_snapshot(from: &Path, to: &Path) -> Result<()> {
+pub(super) fn copy_snapshot(from: &Path, to: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new().mode(0o700).create(to)?;
     for entry in fs::read_dir(from)? {

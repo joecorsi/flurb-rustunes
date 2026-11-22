@@ -176,6 +176,7 @@ pub(crate) fn event(event: &Event<'_>) -> Result<()> {
             line()?,
             json!({"directory": path(directory)}),
         ),
+        Event::InsertBatchSending => Ok(()),
         Event::InsertBatchStarted {
             number,
             batches,

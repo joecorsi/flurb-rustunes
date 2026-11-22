@@ -10,7 +10,7 @@ mod list_view;
 mod logging;
 mod machine;
 mod metadata_set;
-mod playlist_push;
+pub(crate) mod playlist_push;
 mod progress;
 mod pull;
 mod recovery;
